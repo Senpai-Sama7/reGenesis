@@ -39,12 +39,12 @@ function fontLink(identity){
 export async function requestGemini({ model, prompt, timeout = 30000 }){
   const key = process.env.GEMINI_API_KEY;
   if (!key) { console.error("GEMINI_API_KEY is required"); process.exit(1); }
-  const controller = new AbortController();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
   const body = { contents: [{ parts: [{ text: prompt }]}], generationConfig: { temperature: 0, topK: 1, topP: 0.9 } };
   const retries = [500, 1000, 2000];
   let lastErr = null;
   for (let i=0;i<retries.length+1;i++){
+    const controller = new AbortController();
     try {
       const t = setTimeout(() => controller.abort(), timeout);
       const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal });
