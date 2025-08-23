@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="assets/logo.png" alt="reGenesis" width="300"/>
+</p>
 
 -----
 
