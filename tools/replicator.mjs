@@ -11,6 +11,7 @@ import path from "node:path";
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import os from "node:os";
 import zlib from "node:zlib";
 
@@ -385,7 +386,6 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const full = path.join(this.state.outputDir, localPath);
           await fs.mkdir(path.dirname(full), { recursive: true });
 
-          const { Transform } = await import('node:stream');
           const optimizationStream = this.getOptimizationStream(contentType);
           const compressionStream = useBrotli ? zlib.createBrotliCompress() : null;
           const writeStream = fss.createWriteStream(full);
@@ -417,7 +417,6 @@ export class UltimateWebsiteReplicator extends EventEmitter {
   }
 
   getOptimizationStream(contentType){
-    const { Transform } = require('stream'); // will fallback if import not available
     if (this.options.optimizeImages && contentType.startsWith('image/')){
       if (contentType.includes('svg')){
         return new Transform({

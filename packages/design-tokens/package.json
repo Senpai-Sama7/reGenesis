@@ -2,10 +2,17 @@
   "name": "@cyberarchitect/design-tokens",
   "version": "1.0.0",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/tokens.js",
+  "types": "dist/tokens.d.ts",
   "scripts": {
-    "build": "node build.js"
+    "build": "node build.cjs"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/tokens.js",
+      "default": "./dist/tokens.js"
+    },
+    "./tokens.css": "./dist/tokens.css"
   },
   "devDependencies": {},
   "license": "MIT"
