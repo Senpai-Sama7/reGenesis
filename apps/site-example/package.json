@@ -1,0 +1,19 @@
+{
+  "name": "@cyberarchitect/site-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build && next export",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "@cyberarchitect/ui": "1.0.0",
+    "@cyberarchitect/motion": "1.0.0",
+    "@cyberarchitect/scroll": "1.0.0"
+  }
+}

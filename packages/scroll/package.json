@@ -1,0 +1,19 @@
+{
+  "name": "@cyberarchitect/scroll",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@studio-freight/lenis": "^1.0.44",
+    "gsap": "^3.12.5"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.2",
+    "typescript": "^5.5.4"
+  },
+  "scripts": {
+    "build": "tsup"
+  },
+  "license": "MIT"
+}

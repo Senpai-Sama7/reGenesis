@@ -1,0 +1,11 @@
+{
+  "name": "@cyberarchitect/motion-tokens",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/motion.ts",
+  "types": "dist/motion.ts",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "license": "MIT"
+}
