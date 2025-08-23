@@ -1,0 +1,43 @@
+{
+  "name": "reGenesis",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.7.0",
+  "engines": { "node": ">=20.0.0" },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm run build:tokens && pnpm run build:packages",
+    "build:tokens": "pnpm --filter @cyberarchitect/design-tokens build && pnpm --filter @cyberarchitect/motion-tokens build",
+    "build:packages": "pnpm -r --filter \"./packages/*\" --parallel=false run build",
+    "dev": "pnpm --filter @cyberarchitect/site-example dev",
+    "app:build": "pnpm --filter @cyberarchitect/site-example build",
+    "app:start": "pnpm --filter @cyberarchitect/site-example start",
+    "generate": "node tools/generate.mjs",
+    "replicate": "node tools/replicator.mjs replicate",
+    "verify": "node tools/replicator.mjs verify"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^2.1.1",
+    "cheerio": "^1.0.0-rc.12",
+    "p-queue": "^8.0.1",
+    "pino": "^9.3.2",
+    "puppeteer": "^22.13.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "robots-parser": "^3.0.1",
+    "sharp": "^0.33.4",
+    "svgo": "^3.2.0",
+    "undici": "^6.19.8",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.2",
+    "typescript": "^5.5.4"
+  }
+}
+
