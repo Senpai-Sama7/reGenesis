@@ -21,7 +21,7 @@
     "generate": "node tools/generate.mjs",
     "replicate": "node tools/replicator.mjs replicate",
     "verify": "node tools/replicator.mjs verify",
-    "test": "node --test packages/testing/*.mjs"
+    "test": "c8 --check-coverage --branches 20 --functions 20 --lines 30 node --test packages/testing/*.mjs packages/testing/*.cjs"
   },
   "dependencies": {
     "ajv": "^8.17.1",
@@ -43,6 +43,7 @@
     "yargs": "^17.7.2"
   },
   "devDependencies": {
+    "c8": "^9.1.0",
     "tsup": "^8.0.2",
     "typescript": "^5.5.4"
   }

@@ -18,7 +18,7 @@ export function createOptimizationPipeline(contentType, options, cssProcessor, p
     }));
   }
 
-  if (options.optimizeImages && contentType.startsWith('image/')) {
+  if (options.imagePolicy !== 'none' && contentType.startsWith('image/')) {
     if (contentType.includes('svg')) {
       streams.push(new Transform({
         readableHighWaterMark: 1 << 20,
@@ -34,8 +34,8 @@ export function createOptimizationPipeline(contentType, options, cssProcessor, p
       }));
     } else {
       const s = sharp();
-      if (options.enableAVIF) s.avif({ quality: 75 });
-      else s.webp({ quality: 80 });
+      if (options.imagePolicy === 'avif') s.avif({ quality: 75 });
+      else if (options.imagePolicy === 'webp') s.webp({ quality: 80 });
       streams.push(s);
     }
   }
@@ -44,9 +44,7 @@ export function createOptimizationPipeline(contentType, options, cssProcessor, p
     try {
       const s = plugin(contentType);
       if (s) streams.push(s);
-    } catch (e) {
-      console.warn('Failed to initialize optimization plugin:', e);
-    }
+    } catch {}
   }
 
   if (streams.length === 0) return [new PassThrough()];

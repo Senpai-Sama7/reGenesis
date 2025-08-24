@@ -42,6 +42,26 @@ export class HTMLProcessor {
       const css = $el.html() || '';
       $el.html(cssProcessor.rewriteUrls(css, urlRewriter));
     });
+    $('meta[property="og:image"], meta[name="twitter:image"]').each((_, el) => {
+      const $el = $(el);
+      const val = $el.attr('content');
+      if (val) $el.attr('content', urlRewriter(val));
+    });
+    $('script[type="application/ld+json"]').each((_, el) => {
+      const $el = $(el);
+      try {
+        const data = JSON.parse($el.html() || '{}');
+        const traverse = (obj) => {
+          for (const k of Object.keys(obj)) {
+            const v = obj[k];
+            if (typeof v === 'string' && /^https?:/.test(v)) obj[k] = urlRewriter(v);
+            else if (v && typeof v === 'object') traverse(v);
+          }
+        };
+        traverse(data);
+        $el.html(JSON.stringify(data));
+      } catch {}
+    });
     return $.html();
   }
 
