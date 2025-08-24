@@ -677,7 +677,8 @@ export class UltimateWebsiteReplicator extends EventEmitter {
   }
   resolveOutputPath(p){
     const isWindowsAbs = /^[a-zA-Z]:[\\/]/.test(p);
-    if (path.isAbsolute(p) || isWindowsAbs) {
+    const hasTraversal = /(^|[\\/])\.\.([\\/]|$)/.test(p);
+    if (path.isAbsolute(p) || isWindowsAbs || hasTraversal) {
       throw new Error(`Path traversal attempt blocked: ${p}`);
     }
     const normalized = path.normalize(p).replace(/^([.][.][/\\])+/, '');
