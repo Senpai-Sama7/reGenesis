@@ -36,7 +36,7 @@ test('replicator crawls a local site', async () => {
     responsiveBreakpoints: [{ name: 'desk', width: 800, height: 600 }]
   });
   await r.replicate(`http://localhost:${port}/`, out);
-  server.close();
+  await new Promise(res => server.close(res));
 
   const html = await readFile(path.join(out, 'index.html'), 'utf8');
   assert.match(html, /a.png/);
