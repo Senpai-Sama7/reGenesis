@@ -16,7 +16,6 @@ import { Transform } from "node:stream";
 import os from "node:os";
 import zlib from "node:zlib";
 
-import puppeteer from "puppeteer";
 import puppeteerExtra from "puppeteer-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
 import * as cheerio from "cheerio";
@@ -300,16 +299,16 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       this.telemetry.recordMemoryUsage(usage);
       if (usage > this.options.memoryThreshold){
         logger.warn({ usage }, 'Memory threshold exceeded. Pausing queues.');
-        try { this.pageQueue.pause(); } catch {}
+        try { this.pageQueue.pause(); } catch (e) { void e; }
         for (const q of this.state.domainQueues.values()){
-          try { q.pause(); } catch {}
+          try { q.pause(); } catch (e) { void e; }
         }
         if (global.gc){ logger.info('Forcing GC.'); global.gc(); }
       } else {
         // Resume if previously paused
-        try { this.pageQueue.start(); } catch {}
+        try { this.pageQueue.start(); } catch (e) { void e; }
         for (const q of this.state.domainQueues.values()){
-          try { q.start(); } catch {}
+          try { q.start(); } catch (e) { void e; }
         }
       }
     }, intervalMs);
@@ -538,7 +537,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           try {
             await pipeline(streams);
           } finally {
-            try { if (optimizationCleanup) optimizationCleanup(); } catch {}
+            try { if (optimizationCleanup) optimizationCleanup(); } catch (e) { void e; }
           }
           const duration = performance.now() - start;
 
@@ -549,7 +548,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
             etag: res.headers.get('etag'), lastModified: res.headers.get('last-modified')
           };
           this.stats.totalAssets++; this.stats.totalSize += bytes;
-          try { this.telemetry.recordAssetProcessing(new URL(assetUrl).hostname, duration, bytes); } catch {}
+          try { this.telemetry.recordAssetProcessing(new URL(assetUrl).hostname, duration, bytes); } catch (e) { void e; }
           this.state.pendingAssets.delete(assetUrl);
           logger.info({ path: localPathBrotli, size: `${(bytes/1024).toFixed(2)} KB` }, 'Asset captured');
         });
@@ -652,7 +651,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       try{
         const abs = new URL(href, baseUrl).href.split('#')[0];
         if (abs.startsWith(this.state.baseUrl)) links.add(abs);
-      } catch {}
+      } catch (e) { void e; }
     });
     return Array.from(links);
   }
@@ -661,7 +660,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     try{
       const abs = new URL(originalUrl, baseUrl).href;
       if (this.state.urlToLocalPath.has(abs)) return this.state.urlToLocalPath.get(abs);
-    } catch {}
+    } catch (e) { void e; }
     return originalUrl;
   }
   getLocalPathForUrl(assetUrl){
@@ -734,7 +733,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
 // --- CLI ---
 async function main(){
-  const argv = yargs(hideBin(process.argv))
+  yargs(hideBin(process.argv))
     .command('replicate <url> [outputDir]', 'Replicate a website', (y) => {
       y.positional('url', { type: 'string', demandOption: true })
        .positional('outputDir', { type: 'string', default: './replicated-site' })
