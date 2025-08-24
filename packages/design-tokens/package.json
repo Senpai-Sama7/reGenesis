@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "dist/tokens.js",
+  "module": "dist/tokens.js",
   "types": "dist/tokens.d.ts",
   "scripts": {
     "build": "node build.cjs"

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "dist/motion.js",
+  "module": "dist/motion.js",
   "types": "dist/motion.d.ts",
   "scripts": {
     "build": "node build.cjs"
