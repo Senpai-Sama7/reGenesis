@@ -2,10 +2,11 @@
   "name": "@cyberarchitect/scroll",
   "version": "1.0.0",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "dependencies": {
-    "@studio-freight/lenis": "^1.0.44",
+    "@studio-freight/lenis": "^1.0.42",
     "gsap": "^3.12.5"
   },
   "devDependencies": {
@@ -14,6 +15,13 @@
   },
   "scripts": {
     "build": "tsup"
+  },
+  "exports": {
+    ".": {
+      "require": "./dist/index.cjs",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
   },
   "license": "MIT"
 }
