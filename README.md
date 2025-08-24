@@ -114,6 +114,9 @@ node tools/replicator.mjs replicate https://example.com ./replicas/example-site
 node tools/replicator.mjs replicate https://example.com ./replicas/example-site --depth 3 --responsive --brotli
 ```
 
+You can also create a `regenesis.config.json` to store default options. The replicator will automatically load this configuration
+and merge it with CLI flags, or you can specify a custom path with `--config`.
+
 #### Verify a Replica's Integrity
 
 This command checks the SHA-256 hashes of a replicated site against its manifest to ensure no files are corrupted or missing.
