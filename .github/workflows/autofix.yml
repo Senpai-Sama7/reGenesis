@@ -33,7 +33,7 @@ jobs:
         run: node tools/local-autofix.mjs
 
       - name: Create PR with changes (if any)
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           commit-message: "chore: apply local autofix scaffolding"
           branch: ci/autofix
