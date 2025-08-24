@@ -400,7 +400,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const isText = /^(text\/|application\/(javascript|json|xml))/.test(contentType);
           const useBrotli = this.options.enableBrotli && isText;
           const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
-          const full = this.resolveOutputPath(localPathBrotli);
+          const full = this.resolveOutputPath(localPathBrotli)
           await fs.mkdir(path.dirname(full), { recursive: true });
 
           const optimizationStream = this.getOptimizationStream(contentType);
