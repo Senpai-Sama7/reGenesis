@@ -10,7 +10,7 @@ on:
 
 jobs:
   audit:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, docker]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
         run: node tools/local-audit.mjs
 
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, docker]
     needs: [audit]
     steps:
       - name: Checkout code
@@ -61,7 +61,7 @@ jobs:
         run: pnpm run generate -- --brief ./packages/schemas/examples/brand-brief.example.json --outputDir ./out --dry-run
       
   security:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, docker]
     needs: [build-and-test]
     steps:
       - name: Checkout code
