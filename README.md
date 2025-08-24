@@ -111,8 +111,11 @@ This command crawls a live website, downloads its assets, and creates a local, o
 node tools/replicator.mjs replicate https://example.com ./replicas/example-site
 
 # Perform a deep crawl with responsive screenshots and Brotli compression
-node tools/replicator.mjs replicate https://example.com ./replicas/example-site --depth 3 --responsive --brotli
+node tools/replicator.mjs replicate https://example.com ./replicas/example-site --depth 3 --responsive --compression brotli --image webp
 ```
+
+You can also create a `regenesis.config.json` to store default options. The replicator will automatically load this configuration
+and merge it with CLI flags, or you can specify a custom path with `--config`.
 
 #### Verify a Replica's Integrity
 
@@ -121,6 +124,12 @@ This command checks the SHA-256 hashes of a replicated site against its manifest
 ```bash
 node tools/replicator.mjs verify ./replicas/example-site
 ```
+
+-----
+
+### ♿ Accessibility Defaults
+
+Basic reduced-motion and focus-visible styles are available at `assets/accessibility.css`. Include this stylesheet to ensure usable defaults even without generator output.
 
 -----
 
