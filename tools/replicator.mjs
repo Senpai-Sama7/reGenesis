@@ -168,6 +168,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       responsiveBreakpoints: [{ name: 'mobile', width: 375, height: 812 }, { name: 'desktop', width: 1920, height: 1080 }],
       enableBrotli: false,
       memoryThreshold: 0.85,
+      allowedDomains: [],
     }, options);
 
     this.pageQueue = new PQueue({ concurrency: this.options.pageConcurrency });
@@ -187,6 +188,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       memoryMonitor: null,
       domainQueues: new Map(),
       circuitBreakers: new Map(),
+      allowedDomains: new Set(),
     };
     this.stats = { totalAssets: 0, totalSize: 0, crawledPages: 0, skippedAssets: 0, failedAssets: 0 };
     ['SIGINT', 'SIGTERM'].forEach(sig => process.on(sig, () => this.shutdown()));
@@ -224,6 +226,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     const start = Date.now();
     this.state.baseUrl = new URL(targetUrl).origin;
     this.state.outputDir = path.resolve(outputDir);
+    this.state.allowedDomains = new Set([new URL(targetUrl).hostname, ...this.options.allowedDomains]);
     await fs.mkdir(this.state.outputDir, { recursive: true });
     logger.info({ options: this.options }, 'Replication starting');
 
@@ -325,7 +328,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
       const rewritten = this.htmlProcessor.rewriteUrls(html, (u) => this.rewriteUrl(u, pageUrl), this.cssProcessor);
       const localPath = this.getLocalPathForUrl(pageUrl);
-      const full = path.join(this.state.outputDir, localPath);
+      const full = this.resolveOutputPath(localPath);
       await fs.mkdir(path.dirname(full), { recursive: true });
       await fs.writeFile(full, rewritten);
       const hash = crypto.createHash('sha256').update(rewritten).digest('hex');
@@ -367,8 +370,12 @@ export class UltimateWebsiteReplicator extends EventEmitter {
   captureAsset(assetUrl){
     const localPath = this.getLocalPathForUrl(assetUrl);
     if (this.state.manifest.assets[localPath] || this.state.failedUrls.has(assetUrl) || this.state.pendingAssets.has(assetUrl)) return;
-    this.state.pendingAssets.add(assetUrl);
     const domain = new URL(assetUrl).hostname;
+    if (!this.state.allowedDomains.has(domain)){
+      logger.warn({ url: assetUrl }, 'Blocked by domain allowlist');
+      return;
+    }
+    this.state.pendingAssets.add(assetUrl);
     const q = this.getQueueForDomain(domain);
     const cb = this.getCircuitBreakerForDomain(domain);
     q.add(() => this.fetchAndProcessAsset(assetUrl, cb));
@@ -393,7 +400,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const isText = /^(text\/|application\/(javascript|json|xml))/.test(contentType);
           const useBrotli = this.options.enableBrotli && isText;
           const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
-          const full = path.join(this.state.outputDir, localPathBrotli);
+          const full = this.resolveOutputPath(localPathBrotli)
           await fs.mkdir(path.dirname(full), { recursive: true });
 
           const optimizationStream = this.getOptimizationStream(contentType);
@@ -462,14 +469,15 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     await page.setViewport(bp);
     await page.waitForTimeout(500);
     const screenshotPath = this.getLocalPathForUrl(pageUrl).replace(/\.html$/, `_${bp.name}.png`);
-    const full = path.join(this.state.outputDir, screenshotPath);
+    const full = this.resolveOutputPath(screenshotPath);
+    await fs.mkdir(path.dirname(full), { recursive: true });
     try { await page.screenshot({ path: full, fullPage: true }); logger.info({ path: screenshotPath }, 'Screenshot saved'); }
     catch (e){ logger.error({ err: e.message }, `Failed screenshot for ${bp.name}`); }
     finally { await page.setViewport(original); }
   }
 
   async loadManifest(){
-    const manifestPath = path.join(this.state.outputDir, 'manifest.json');
+    const manifestPath = this.resolveOutputPath('manifest.json');
     try{
       const data = await fs.readFile(manifestPath, 'utf8');
       this.state.manifest = JSON.parse(data);
@@ -480,7 +488,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     } catch { this.state.manifest = { assets: {} }; }
   }
   async generateManifest(){
-    const manifestPath = path.join(this.state.outputDir, 'manifest.json');
+    const manifestPath = this.resolveOutputPath('manifest.json');
     const data = { replicatedAt: new Date().toISOString(), sourceUrl: this.state.baseUrl, stats: this.stats, assets: this.state.manifest.assets };
     await fs.writeFile(manifestPath, JSON.stringify(data, null, 2));
     logger.info(`Wrote ${manifestPath}`);
@@ -534,6 +542,11 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     const safeDirname = dirname.replace(/[^a-z0-9/_-]/gi, '_');
     return path.join(safeDirname, `${safeBasename}${queryHash}${ext}`);
   }
+  resolveOutputPath(p){
+    const full = path.resolve(this.state.outputDir, p);
+    if (!full.startsWith(this.state.outputDir + path.sep)) throw new Error(`Path traversal: ${p}`);
+    return full;
+  }
 }
 
 // --- CLI ---
@@ -548,7 +561,8 @@ async function main(){
        .option('brotli', { type: 'boolean', default: false })
        .option('pageConcurrency', { type: 'number', default: 4 })
        .option('baseAssetConcurrency', { type: 'number', default: 10 })
-       .option('domainAssetConcurrency', { type: 'number', default: 3 });
+       .option('domainAssetConcurrency', { type: 'number', default: 3 })
+       .option('allow', { type: 'array', default: [], describe: 'Additional allowed domains' });
     }, async (a) => {
       const r = new UltimateWebsiteReplicator({
         maxCrawlDepth: a.depth,
@@ -558,6 +572,7 @@ async function main(){
         pageConcurrency: a.pageConcurrency,
         baseAssetConcurrency: a.baseAssetConcurrency,
         domainAssetConcurrency: a.domainAssetConcurrency,
+        allowedDomains: a.allow,
       });
       await r.replicate(a.url, a.outputDir);
     })
