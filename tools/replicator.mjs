@@ -169,6 +169,9 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       enableBrotli: false,
       memoryThreshold: 0.85,
       allowedDomains: [],
+      maxAssetSize: 5 * 1024 * 1024,
+      requestTimeout: 30000,
+      requestInterval: 0,
     }, options);
 
     this.pageQueue = new PQueue({ concurrency: this.options.pageConcurrency });
@@ -260,16 +263,18 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async discoverInitialUrls(entryUrl){
     const urls = new Set([entryUrl]);
-    try{
-      const robotsUrl = new URL('/robots.txt', this.state.baseUrl).href;
-      const res = await fetch(robotsUrl);
-      if (res.ok){
-        const txt = await res.text();
-        this.state.robots = robotsParser(robotsUrl, txt);
-        const sitemaps = this.state.robots.getSitemaps();
-        for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
-      }
-    } catch (e){ logger.warn({ e: e.message }, 'robots.txt unavailable'); }
+    if (this.options.respectRobotsTxt){
+      try{
+        const robotsUrl = new URL('/robots.txt', this.state.baseUrl).href;
+        const res = await fetch(robotsUrl);
+        if (res.ok){
+          const txt = await res.text();
+          this.state.robots = robotsParser(robotsUrl, txt);
+          const sitemaps = this.state.robots.getSitemaps();
+          for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
+        }
+      } catch (e){ logger.warn({ e: e.message }, 'robots.txt unavailable'); }
+    }
     try{ await this.parseSitemap(new URL('/sitemap.xml', this.state.baseUrl).href, urls); }
     catch(e){ logger.warn('No default sitemap.xml'); }
     return urls;
@@ -293,7 +298,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async processPage(pageUrl, depth){
     if (depth > this.options.maxCrawlDepth) return;
-    if (this.state.robots && !this.state.robots.isAllowed(pageUrl, this.options.userAgent)){
+    if (this.options.respectRobotsTxt && this.state.robots && !this.state.robots.isAllowed(pageUrl, this.options.userAgent)){
       logger.warn({ url: pageUrl }, 'Disallowed by robots.txt'); return;
     }
     logger.info({ url: pageUrl, depth }, 'Processing page');
@@ -356,8 +361,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     if (!this.state.domainQueues.has(domain)){
       const isBase = domain === new URL(this.state.baseUrl).hostname;
       const concurrency = isBase ? this.options.baseAssetConcurrency : this.options.domainAssetConcurrency;
-      logger.info({ domain, concurrency }, 'Creating domain queue');
-      this.state.domainQueues.set(domain, new PQueue({ concurrency }));
+      const qOpts = { concurrency };
+      if (this.options.requestInterval){ qOpts.intervalCap = 1; qOpts.interval = this.options.requestInterval; }
+      logger.info({ domain, concurrency, interval: this.options.requestInterval }, 'Creating domain queue');
+      this.state.domainQueues.set(domain, new PQueue(qOpts));
     }
     return this.state.domainQueues.get(domain);
   }
@@ -387,28 +394,36 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       return;
     }
     for (let attempt=0; attempt <= this.options.maxRetries; attempt++){
+      let full;
       try{
         return await circuitBreaker.execute(async () => {
           const headers = {};
           const existing = this.state.manifest.assets[localPath];
           if (this.options.incremental && existing?.etag) headers['If-None-Match'] = existing.etag;
           if (this.options.incremental && existing?.lastModified) headers['If-Modified-Since'] = existing.lastModified;
-          const res = await fetch(assetUrl, { headers });
+          const controller = new AbortController();
+          const t = setTimeout(() => controller.abort(), this.options.requestTimeout);
+          const res = await fetch(assetUrl, { headers, signal: controller.signal });
+          clearTimeout(t);
           if (res.status === 304){ logger.info({ url: assetUrl }, 'Asset 304'); this.stats.skippedAssets++; return; }
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const contentType = res.headers.get('content-type') || '';
           const isText = /^(text\/|application\/(javascript|json|xml))/.test(contentType);
           const useBrotli = this.options.enableBrotli && isText;
           const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
-          const full = this.resolveOutputPath(localPathBrotli)
+          full = this.resolveOutputPath(localPathBrotli);
           await fs.mkdir(path.dirname(full), { recursive: true });
 
           const optimizationStream = this.getOptimizationStream(contentType);
           const compressionStream = useBrotli ? zlib.createBrotliCompress() : null;
           const hash = crypto.createHash('sha256');
           let bytes = 0;
+          const max = this.options.maxAssetSize;
           const hashStream = new Transform({
-            transform(chunk, enc, cb){ hash.update(chunk); bytes += chunk.length; cb(null, chunk); }
+            transform(chunk, enc, cb){
+              bytes += chunk.length; if (bytes > max) return cb(new Error('max size exceeded'));
+              hash.update(chunk); cb(null, chunk);
+            }
           });
           const writeStream = fss.createWriteStream(full);
 
@@ -426,7 +441,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           logger.info({ path: localPathBrotli, size: `${(bytes/1024).toFixed(2)} KB` }, 'Asset captured');
         });
       } catch (e){
+        if (full) await fs.unlink(full).catch(()=>{});
         logger.warn({ url: assetUrl, attempt: attempt+1, err: e.message }, 'Asset download failed');
+        const fatal = e.name === 'AbortError' || /max size/i.test(e.message);
+        if (fatal) attempt = this.options.maxRetries;
         if (attempt < this.options.maxRetries){
           const delay = (this.options.retryDelayBase * Math.pow(2, attempt)) + (Math.random() * 1000);
           await new Promise(r => setTimeout(r, delay));
@@ -562,17 +580,25 @@ async function main(){
        .option('pageConcurrency', { type: 'number', default: 4 })
        .option('baseAssetConcurrency', { type: 'number', default: 10 })
        .option('domainAssetConcurrency', { type: 'number', default: 3 })
-       .option('allow', { type: 'array', default: [], describe: 'Additional allowed domains' });
+       .option('allow', { type: 'array', default: [], describe: 'Additional allowed domains' })
+       .option('ignore-robots', { type: 'boolean', default: false, describe: 'Ignore robots.txt (1 req/sec rate limit)' })
+       .option('maxSize', { type: 'number', default: 5 * 1024 * 1024, describe: 'Max asset size in bytes' })
+       .option('reqTimeout', { type: 'number', default: 30000, describe: 'Asset request timeout ms' });
     }, async (a) => {
+      if (a['ignore-robots']) logger.warn('Ignoring robots.txt! Crawl responsibly.');
       const r = new UltimateWebsiteReplicator({
         maxCrawlDepth: a.depth,
         incremental: a.incremental,
         captureResponsive: a.responsive,
         enableBrotli: a.brotli,
-        pageConcurrency: a.pageConcurrency,
-        baseAssetConcurrency: a.baseAssetConcurrency,
-        domainAssetConcurrency: a.domainAssetConcurrency,
+        pageConcurrency: a['ignore-robots'] ? 1 : a.pageConcurrency,
+        baseAssetConcurrency: a['ignore-robots'] ? 2 : a.baseAssetConcurrency,
+        domainAssetConcurrency: a['ignore-robots'] ? 1 : a.domainAssetConcurrency,
         allowedDomains: a.allow,
+        respectRobotsTxt: !a['ignore-robots'],
+        maxAssetSize: a.maxSize,
+        requestTimeout: a.reqTimeout,
+        requestInterval: a['ignore-robots'] ? 1000 : 0,
       });
       await r.replicate(a.url, a.outputDir);
     })
