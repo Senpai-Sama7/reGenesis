@@ -19,13 +19,17 @@ import zlib from "node:zlib";
 import puppeteerExtra from "puppeteer-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
 import * as cheerio from "cheerio";
-import sharp from "sharp";
 import PQueue from "p-queue";
-import { optimize as optimizeSvg } from "svgo";
 import pino from "pino";
 import yargs from "yargs/yargs";
 import { hideBin } from "yargs/helpers";
 import robotsParser from "robots-parser";
+import { CSSProcessor } from "./lib/replicator/css-processor.mjs";
+import { HTMLProcessor } from "./lib/replicator/html-processor.mjs";
+import { AdvancedCircuitBreaker } from "./lib/replicator/advanced-circuit-breaker.mjs";
+import { createOptimizationPipeline } from "./lib/replicator/optimization-pipeline.mjs";
+import { cosmiconfig } from "cosmiconfig";
+import { RegenesisError, ERROR_CODES } from "./lib/errors.mjs";
 
 if (!globalThis.fetch) {
   const { fetch, Request, Response, Headers } = await import("undici");
@@ -247,17 +251,18 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       crawlSPA: true,
       maxCrawlDepth: 2,
       respectRobotsTxt: true,
-      optimizeImages: true,
-      enableAVIF: true,
+      imagePolicy: 'avif', // 'avif' | 'webp' | 'none'
       minifyCSS: true,
+      minifyHTML: true,
       captureResponsive: false,
       responsiveBreakpoints: [{ name: 'mobile', width: 375, height: 812 }, { name: 'desktop', width: 1920, height: 1080 }],
-      enableBrotli: false,
+      compression: 'none', // 'none' | 'brotli'
       memoryThreshold: 0.85,
       allowedDomains: [],
       maxAssetSize: 5 * 1024 * 1024,
       requestTimeout: 30000,
       requestInterval: 0,
+      optimizationPlugins: [],
     }, options);
 
     this.pageQueue = new AdaptiveQueue({ concurrency: this.options.pageConcurrency });
@@ -280,7 +285,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       circuitBreakers: new Map(),
       allowedDomains: new Set(),
     };
-    this.stats = { totalAssets: 0, totalSize: 0, crawledPages: 0, skippedAssets: 0, failedAssets: 0 };
+    this.stats = { totalAssets: 0, totalSize: 0, crawledPages: 0, skippedAssets: 0, failedAssets: 0, totalDownloadTime: 0 };
     ['SIGINT', 'SIGTERM'].forEach(sig => process.on(sig, () => this.shutdown()));
   }
 
@@ -314,17 +319,32 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     }, intervalMs);
   }
 
+  pauseQueues(){
+    this.pageQueue.pause();
+    for (const q of this.state.domainQueues.values()) q.pause();
+  }
+
+  resumeQueues(){
+    this.pageQueue.start();
+    for (const q of this.state.domainQueues.values()) q.start();
+  }
+
   async shutdown(){
     logger.info('Shutting down...');
     if (this.state.memoryMonitor) clearInterval(this.state.memoryMonitor);
     this.pageQueue.clear();
     Array.from(this.state.domainQueues.values()).forEach(q => q.clear());
     if (this.state.browser) await this.state.browser.close();
+    if (logger.flush) logger.flush();
+    if (logger.transport && logger.transport.end){
+      await new Promise(res => logger.transport.end(res));
+    }
     logger.info('Shutdown complete.');
   }
 
   async replicate(targetUrl, outputDir){
     const start = Date.now();
+    this.stats.startTime = new Date().toISOString();
     this.state.baseUrl = new URL(targetUrl).origin;
     this.state.outputDir = path.resolve(outputDir);
     this.state.allowedDomains = new Set([new URL(targetUrl).hostname, ...this.options.allowedDomains]);
@@ -349,8 +369,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       await Promise.all(Array.from(this.state.domainQueues.values()).map(q => q.onIdle()));
       await this.generateManifest();
       const duration = (Date.now() - start) / 1000;
-      logger.info({ duration: `${duration.toFixed(2)}s`, stats: this.stats }, 'Replication complete');
-      this.emit('complete', { duration, stats: this.stats });
+      this.stats.endTime = new Date().toISOString();
+      const avg = this.stats.totalAssets ? this.stats.totalDownloadTime / this.stats.totalAssets : 0;
+      logger.info({ duration: `${duration.toFixed(2)}s`, avgLatency: `${avg.toFixed(2)}ms`, stats: this.stats }, 'Replication complete');
+      this.emit('complete', { duration, stats: this.stats, avgLatency: avg });
     } catch (e){
       logger.fatal(e, 'Fatal during replication');
       throw e;
@@ -424,7 +446,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
         const u = r.url();
         if (r.ok() && !u.startsWith('data:')) discovered.add(u);
       });
-      await page.waitForTimeout(1000);
+      await page.waitForNetworkIdle({ idleTime: 500, timeout: this.options.timeout }).catch(() => {});
       let html = await page.content();
       const etag = res.headers().etag;
       const lastModified = res.headers()['last-modified'];
@@ -435,7 +457,8 @@ export class UltimateWebsiteReplicator extends EventEmitter {
         this.captureAsset(assetUrl);
       }
 
-      const rewritten = this.htmlProcessor.rewriteUrls(html, (u) => this.rewriteUrl(u, pageUrl), this.cssProcessor);
+      let rewritten = this.htmlProcessor.rewriteUrls(html, (u) => this.rewriteUrl(u, pageUrl), this.cssProcessor);
+      if (this.options.minifyHTML) rewritten = await this.htmlProcessor.minify(rewritten);
       const localPath = this.getLocalPathForUrl(pageUrl);
       const full = this.resolveOutputPath(localPath);
       await fs.mkdir(path.dirname(full), { recursive: true });
@@ -513,10 +536,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const res = await fetch(assetUrl, { headers, signal: controller.signal });
           clearTimeout(t);
           if (res.status === 304){ logger.info({ url: assetUrl }, 'Asset 304'); this.stats.skippedAssets++; return; }
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) throw new RegenesisError(ERROR_CODES.FETCH_FAIL, `HTTP ${res.status}`);
           const contentType = res.headers.get('content-type') || '';
           const isText = /^(text\/|application\/(javascript|json|xml))/.test(contentType);
-          const useBrotli = this.options.enableBrotli && isText;
+          const useBrotli = this.options.compression === 'brotli' && isText;
           const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
           full = this.resolveOutputPath(localPathBrotli);
           await fs.mkdir(path.dirname(full), { recursive: true });
@@ -527,7 +550,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const max = this.options.maxAssetSize;
           const hashStream = new Transform({
             transform(chunk, enc, cb){
-              bytes += chunk.length; if (bytes > max) return cb(new Error('max size exceeded'));
+              bytes += chunk.length; if (bytes > max) return cb(new RegenesisError(ERROR_CODES.MAX_SIZE, 'max size exceeded'));
               hash.update(chunk); cb(null, chunk);
             }
           });
@@ -599,13 +622,35 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     logger.info({ url: pageUrl, viewport: bp.name }, 'Capturing screenshot');
     const original = page.viewport();
     await page.setViewport(bp);
-    await page.waitForTimeout(500);
+    try {
+      await page.waitForNetworkIdle({ idleTime: 500, timeout: 5000 });
+    } catch {}
     const screenshotPath = this.getLocalPathForUrl(pageUrl).replace(/\.html$/, `_${bp.name}.png`);
     const full = this.resolveOutputPath(screenshotPath);
     await fs.mkdir(path.dirname(full), { recursive: true });
-    try { await page.screenshot({ path: full, fullPage: true }); logger.info({ path: screenshotPath }, 'Screenshot saved'); }
-    catch (e){ logger.error({ err: e.message }, `Failed screenshot for ${bp.name}`); }
-    finally { await page.setViewport(original); }
+    try {
+      await page.screenshot({ path: full, fullPage: true });
+      const buf = await fs.readFile(full);
+      const hash = crypto.createHash('sha256').update(buf).digest('hex');
+      this.state.manifest.assets[screenshotPath] = {
+        originalUrl: pageUrl,
+        contentType: 'image/png',
+        size: buf.length,
+        integrity: `sha256-${hash}`
+      };
+      const pageLocal = this.getLocalPathForUrl(pageUrl);
+      const pageEntry = this.state.manifest.assets[pageLocal];
+      if (pageEntry){
+        pageEntry.screenshots = pageEntry.screenshots || {};
+        pageEntry.screenshots[bp.name] = screenshotPath;
+      }
+      this.stats.totalAssets++; this.stats.totalSize += buf.length;
+      logger.info({ path: screenshotPath }, 'Screenshot saved');
+    } catch (e){
+      logger.error({ err: e.message }, `Failed screenshot for ${bp.name}`);
+    } finally {
+      await page.setViewport(original);
+    }
   }
 
   async loadManifest(){
@@ -740,21 +785,33 @@ async function main(){
        .option('depth', { type: 'number', default: 2 })
        .option('incremental', { type: 'boolean', default: false })
        .option('responsive', { type: 'boolean', default: false })
-       .option('brotli', { type: 'boolean', default: false })
+       .option('image', { type: 'string', choices: ['avif','webp','none'], default: 'avif' })
+       .option('compression', { type: 'string', choices: ['none','brotli'], default: 'none' })
        .option('pageConcurrency', { type: 'number', default: 4 })
        .option('baseAssetConcurrency', { type: 'number', default: 10 })
        .option('domainAssetConcurrency', { type: 'number', default: 3 })
        .option('allow', { type: 'array', default: [], describe: 'Additional allowed domains' })
        .option('ignore-robots', { type: 'boolean', default: false, describe: 'Ignore robots.txt (1 req/sec rate limit)' })
        .option('maxSize', { type: 'number', default: 5 * 1024 * 1024, describe: 'Max asset size in bytes' })
-       .option('reqTimeout', { type: 'number', default: 30000, describe: 'Asset request timeout ms' });
+       .option('reqTimeout', { type: 'number', default: 30000, describe: 'Asset request timeout ms' })
+       .option('config', { type: 'string', describe: 'Path to config file' });
     }, async (a) => {
+      let fileConfig = {};
+      const explorer = cosmiconfig('regenesis');
+      if (a.config) {
+        const res = await explorer.load(a.config);
+        if (res?.config) fileConfig = res.config;
+      } else {
+        const res = await explorer.search();
+        if (res?.config) fileConfig = res.config;
+      }
       if (a['ignore-robots']) logger.warn('Ignoring robots.txt! Crawl responsibly.');
-      const r = new UltimateWebsiteReplicator({
+      const r = new UltimateWebsiteReplicator(Object.assign({}, fileConfig, {
         maxCrawlDepth: a.depth,
         incremental: a.incremental,
         captureResponsive: a.responsive,
-        enableBrotli: a.brotli,
+        imagePolicy: a.image,
+        compression: a.compression,
         pageConcurrency: a['ignore-robots'] ? 1 : a.pageConcurrency,
         baseAssetConcurrency: a['ignore-robots'] ? 2 : a.baseAssetConcurrency,
         domainAssetConcurrency: a['ignore-robots'] ? 1 : a.domainAssetConcurrency,
@@ -763,7 +820,7 @@ async function main(){
         maxAssetSize: a.maxSize,
         requestTimeout: a.reqTimeout,
         requestInterval: a['ignore-robots'] ? 1000 : 0,
-      });
+      }));
       await r.replicate(a.url, a.outputDir);
     })
     .command('verify <outputDir>', 'Verify integrity of a replica', (y) => {

@@ -47,6 +47,7 @@
     "yargs": "^17.7.2"
   },
   "devDependencies": {
+    "c8": "^9.1.0",
     "tsup": "^8.0.2",
     "typescript": "^5.5.4",
     "@playwright/test": "^1.47.1",
