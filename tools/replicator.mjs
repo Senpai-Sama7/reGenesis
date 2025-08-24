@@ -8,6 +8,8 @@ import fs from "node:fs/promises";
 import fss from "node:fs";
 import path from "node:path";
 import { URL } from "node:url";
+import net from "node:net";
+import { performance } from "node:perf_hooks";
 import crypto from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
@@ -33,6 +35,85 @@ if (!globalThis.fetch) {
 
 puppeteerExtra.use(stealth());
 const logger = pino({ transport: { target: 'pino-pretty' } });
+
+class ReplicationError extends Error {
+  constructor(message, context = {}) {
+    super(message);
+    this.name = 'ReplicationError';
+    this.context = context;
+    this.timestamp = new Date().toISOString();
+  }
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      context: this.context,
+      timestamp: this.timestamp,
+      stack: this.stack
+    };
+  }
+}
+
+class ReplicationTelemetry {
+  constructor() {
+    this.metrics = {
+      assetsProcessed: new Map(),
+      averageProcessingTime: new Map(),
+      errorRates: new Map(),
+      memoryUsage: [],
+      bandwidthUtilization: []
+    };
+  }
+  recordAssetProcessing(domain, duration, size) {
+    const key = `${domain}_processing`;
+    if (!this.metrics.assetsProcessed.has(key)) {
+      this.metrics.assetsProcessed.set(key, []);
+    }
+    this.metrics.assetsProcessed.get(key).push({ duration, size, timestamp: Date.now() });
+  }
+  recordMemoryUsage(usage) {
+    this.metrics.memoryUsage.push({ usage, timestamp: Date.now() });
+  }
+}
+
+class AdaptiveQueue extends PQueue {
+  constructor(options) {
+    super(options);
+    this.adaptiveConcurrency = options?.concurrency || 1;
+    this._durations = [];
+  }
+  async add(fn, options) {
+    const start = performance.now();
+    try {
+      const result = await super.add(fn, options);
+      return result;
+    } finally {
+      const duration = performance.now() - start;
+      this._durations.push(duration);
+      if (this._durations.length > 50) this._durations.shift();
+      this._adaptConcurrency();
+    }
+  }
+  _avgLatency() {
+    if (this._durations.length === 0) return 0;
+    return this._durations.reduce((a, b) => a + b, 0) / this._durations.length;
+  }
+  _getMemoryPressure() {
+    const used = process.memoryUsage().heapUsed;
+    const total = os.totalmem();
+    return used / total;
+  }
+  _adaptConcurrency() {
+    const avg = this._avgLatency();
+    const pressure = this._getMemoryPressure();
+    if (avg > 5000 || pressure > 0.8) {
+      this.concurrency = Math.max(1, (this.concurrency || 1) - 1);
+    } else if (avg < 1000 && pressure < 0.5) {
+      const base = this.adaptiveConcurrency || 1;
+      this.concurrency = Math.min(10, (this.concurrency || base) + 1);
+    }
+  }
+}
 
 class CSSProcessor {
   rewriteUrls(cssContent, urlRewriter) {
@@ -108,11 +189,17 @@ class AdvancedCircuitBreaker extends EventEmitter {
     this.failureCount = 0;
     this.successCount = 0;
     this.nextAttempt = Date.now();
+    this._transitionLock = Promise.resolve();
   }
   async execute(operation){
     if (this.state === 'OPEN'){
-      if (Date.now() < this.nextAttempt) throw new Error('Circuit breaker is OPEN.');
-      this.state = 'HALF_OPEN'; this.successCount = 0;
+      await (this._transitionLock = this._transitionLock.then(async () => {
+        if (this.state === 'OPEN'){
+          if (Date.now() < this.nextAttempt) throw new Error('Circuit breaker is OPEN.');
+          this.state = 'HALF_OPEN';
+          this.successCount = 0;
+        }
+      }));
     }
     try{
       const result = await Promise.race([
@@ -174,9 +261,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       requestInterval: 0,
     }, options);
 
-    this.pageQueue = new PQueue({ concurrency: this.options.pageConcurrency });
+    this.pageQueue = new AdaptiveQueue({ concurrency: this.options.pageConcurrency });
     this.cssProcessor = new CSSProcessor();
     this.htmlProcessor = new HTMLProcessor();
+    this.telemetry = new ReplicationTelemetry();
 
     this.state = {
       browser: null,
@@ -206,14 +294,25 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     logger.info('Browser initialized.');
   }
 
-  startMemoryMonitor(){
+  startMemoryMonitor(intervalMs = 5000){
     this.state.memoryMonitor = setInterval(() => {
       const usage = process.memoryUsage().heapUsed / os.totalmem();
+      this.telemetry.recordMemoryUsage(usage);
       if (usage > this.options.memoryThreshold){
-        logger.warn({ usage }, 'Memory threshold exceeded.');
+        logger.warn({ usage }, 'Memory threshold exceeded. Pausing queues.');
+        try { this.pageQueue.pause(); } catch {}
+        for (const q of this.state.domainQueues.values()){
+          try { q.pause(); } catch {}
+        }
         if (global.gc){ logger.info('Forcing GC.'); global.gc(); }
+      } else {
+        // Resume if previously paused
+        try { this.pageQueue.start(); } catch {}
+        for (const q of this.state.domainQueues.values()){
+          try { q.start(); } catch {}
+        }
       }
-    }, 15000);
+    }, intervalMs);
   }
 
   async shutdown(){
@@ -266,12 +365,16 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     if (this.options.respectRobotsTxt){
       try{
         const robotsUrl = new URL('/robots.txt', this.state.baseUrl).href;
-        const res = await fetch(robotsUrl);
-        if (res.ok){
-          const txt = await res.text();
-          this.state.robots = robotsParser(robotsUrl, txt);
-          const sitemaps = this.state.robots.getSitemaps();
-          for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
+        if (this.isUrlFetchSafe(robotsUrl)){
+          const res = await fetch(robotsUrl);
+          if (res.ok){
+            const txt = await res.text();
+            this.state.robots = robotsParser(robotsUrl, txt);
+            const sitemaps = this.state.robots.getSitemaps();
+            for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
+          }
+        } else {
+          logger.warn({ url: robotsUrl }, 'Blocked robots.txt by SSRF policy');
         }
       } catch (e){ logger.warn({ e: e.message }, 'robots.txt unavailable'); }
     }
@@ -282,6 +385,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async parseSitemap(sitemapUrl, urlSet){
     try{
+      if (!this.isUrlFetchSafe(sitemapUrl)) { logger.warn({ url: sitemapUrl }, 'Blocked sitemap URL by SSRF policy'); return; }
       const res = await fetch(sitemapUrl);
       if (!res.ok) return;
       const xml = await res.text();
@@ -297,6 +401,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
   }
 
   async processPage(pageUrl, depth){
+    if (!this.isUrlFetchSafe(pageUrl)) { logger.warn({ url: pageUrl }, 'Blocked page by SSRF policy'); return; }
     if (depth > this.options.maxCrawlDepth) return;
     if (this.options.respectRobotsTxt && this.state.robots && !this.state.robots.isAllowed(pageUrl, this.options.userAgent)){
       logger.warn({ url: pageUrl }, 'Disallowed by robots.txt'); return;
@@ -364,7 +469,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       const qOpts = { concurrency };
       if (this.options.requestInterval){ qOpts.intervalCap = 1; qOpts.interval = this.options.requestInterval; }
       logger.info({ domain, concurrency, interval: this.options.requestInterval }, 'Creating domain queue');
-      this.state.domainQueues.set(domain, new PQueue(qOpts));
+      this.state.domainQueues.set(domain, new AdaptiveQueue(qOpts));
     }
     return this.state.domainQueues.get(domain);
   }
@@ -397,6 +502,9 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       let full;
       try{
         return await circuitBreaker.execute(async () => {
+          if (!this.isUrlFetchSafe(assetUrl)){
+            throw new ReplicationError('URL blocked by SSRF policy', { url: assetUrl });
+          }
           const headers = {};
           const existing = this.state.manifest.assets[localPath];
           if (this.options.incremental && existing?.etag) headers['If-None-Match'] = existing.etag;
@@ -413,8 +521,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
           full = this.resolveOutputPath(localPathBrotli);
           await fs.mkdir(path.dirname(full), { recursive: true });
-
-          const optimizationStream = this.getOptimizationStream(contentType);
+          const { stream: optimizationStream, cleanup: optimizationCleanup } = this.createOptimizationStream(contentType);
           const compressionStream = useBrotli ? zlib.createBrotliCompress() : null;
           const hash = crypto.createHash('sha256');
           let bytes = 0;
@@ -426,9 +533,14 @@ export class UltimateWebsiteReplicator extends EventEmitter {
             }
           });
           const writeStream = fss.createWriteStream(full);
-
           const streams = [res.body, optimizationStream, compressionStream, hashStream, writeStream].filter(Boolean);
-          await pipeline(streams);
+          const start = performance.now();
+          try {
+            await pipeline(streams);
+          } finally {
+            try { if (optimizationCleanup) optimizationCleanup(); } catch {}
+          }
+          const duration = performance.now() - start;
 
           const integrity = `sha256-${hash.digest('hex')}`;
           this.state.urlToLocalPath.set(assetUrl, localPathBrotli);
@@ -437,6 +549,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
             etag: res.headers.get('etag'), lastModified: res.headers.get('last-modified')
           };
           this.stats.totalAssets++; this.stats.totalSize += bytes;
+          try { this.telemetry.recordAssetProcessing(new URL(assetUrl).hostname, duration, bytes); } catch {}
           this.state.pendingAssets.delete(assetUrl);
           logger.info({ path: localPathBrotli, size: `${(bytes/1024).toFixed(2)} KB` }, 'Asset captured');
         });
@@ -457,10 +570,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     }
   }
 
-  getOptimizationStream(contentType){
+  createOptimizationStream(contentType){
     if (this.options.optimizeImages && contentType.startsWith('image/')){
       if (contentType.includes('svg')){
-        return new Transform({
+        const s = new Transform({
           readableHighWaterMark: 1 << 20,
           writableHighWaterMark: 1 << 20,
           construct(){ this._chunks = []; },
@@ -472,13 +585,15 @@ export class UltimateWebsiteReplicator extends EventEmitter {
             cb();
           }
         });
+        return { stream: s, cleanup: null };
       }
       const s = sharp();
-      if (this.options.enableAVIF) s.avif({ quality: 75 });
-      else s.webp({ quality: 80 });
-      return s;
+      if (this.options.enableAVIF) s.avif({ quality: 75 }); else s.webp({ quality: 80 });
+      const cleanup = () => { try { s.destroy(); } catch {} };
+      return { stream: s, cleanup };
     }
-    return new Transform({ transform(chunk, _enc, cb){ cb(null, chunk); } });
+    const passthrough = new Transform({ transform(chunk, _enc, cb){ cb(null, chunk); } });
+    return { stream: passthrough, cleanup: null };
   }
 
   async captureScreenshot(page, pageUrl, bp){
@@ -561,9 +676,54 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     return path.join(safeDirname, `${safeBasename}${queryHash}${ext}`);
   }
   resolveOutputPath(p){
-    const full = path.resolve(this.state.outputDir, p);
-    if (!full.startsWith(this.state.outputDir + path.sep)) throw new Error(`Path traversal: ${p}`);
+    const normalized = path.normalize(p).replace(/^([.][.][/\\])+/, '').replace(/^[/\\]+/, '');
+    let outputCanonical;
+    try {
+      outputCanonical = fss.realpathSync.native ? fss.realpathSync.native(this.state.outputDir) : fss.realpathSync(this.state.outputDir);
+    } catch {
+      outputCanonical = path.resolve(this.state.outputDir);
+    }
+    const full = path.resolve(outputCanonical, normalized);
+    const rel = path.relative(outputCanonical, full);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error(`Path traversal attempt blocked: ${p}`);
     return full;
+  }
+
+  // --- Security helpers ---
+  isUrlFetchSafe(u) {
+    try {
+      const url = new URL(u);
+      if (!['http:', 'https:'].includes(url.protocol)) return false;
+      const host = url.hostname || '';
+      const ipType = net.isIP(host);
+      if (ipType) {
+        if (this._isPrivateIp(host)) return false;
+      }
+      const lowered = host.toLowerCase();
+      if (lowered === 'localhost' || lowered.endsWith('.localhost') || lowered.endsWith('.local')) return false;
+      if (lowered === '127.0.0.1' || lowered === '::1') return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  _isPrivateIp(ip) {
+    if (ip.includes(':')) { // IPv6 (simple checks)
+      const lower = ip.toLowerCase();
+      if (lower === '::1') return true; // loopback
+      if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // unique local fc00::/7
+      if (lower.startsWith('fe80:')) return true; // link-local
+      return false;
+    }
+    const parts = ip.split('.').map(n => parseInt(n, 10));
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n) || n < 0 || n > 255)) return false;
+    const [a, b] = parts;
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 127) return true; // 127.0.0.0/8
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    return false;
   }
 }
 
