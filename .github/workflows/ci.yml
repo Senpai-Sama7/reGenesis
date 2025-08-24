@@ -1,0 +1,151 @@
+name: reGenesis CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  audit:
+    name: Repo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node 20 with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Enable corepack and pin pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.7.0 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run local audit (markdown + JSON)
+        run: |
+          node tools/local-audit.mjs --json | tee AUDIT.md
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit
+          path: |
+            AUDIT.md
+            AUDIT.json
+
+  build-and-test:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    needs: audit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node 20 with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Enable corepack and pin pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.7.0 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Discover package.json scripts
+        id: pkg
+        shell: bash
+        run: |
+          echo "scripts=$(node -e 'try{const p=require("./package.json"); process.stdout.write(Object.keys(p.scripts||{}).join(","))}catch(e){process.stdout.write("")}')" >> "$GITHUB_OUTPUT"
+
+      - name: Install Playwright browsers (if e2e script exists)
+        if: ${{ contains(steps.pkg.outputs.scripts, 'test:e2e') && hashFiles('playwright.config.*') != '' }}
+        run: npx playwright install --with-deps
+
+      - name: Unit tests
+        run: pnpm run test
+
+      - name: E2E tests (guarded)
+        if: ${{ contains(steps.pkg.outputs.scripts, 'test:e2e') && hashFiles('playwright.config.*') != '' }}
+        run: pnpm run test:e2e
+
+      - name: Generator dry-run (guarded by secret + example brief)
+        if: ${{ env.GEMINI_API_KEY != '' && hashFiles('packages/schemas/examples/brand-brief.example.json') != '' }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          node tools/replicator.mjs generate \
+            --brief ./packages/schemas/examples/brand-brief.example.json \
+            --outputDir ./out \
+            --dry-run
+
+      - name: Upload out directory (if generated)
+        if: ${{ hashFiles('out/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-out
+          path: out
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node 20 with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Enable corepack and pin pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.7.0 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit high severity
+        run: pnpm audit --audit-level=high
+
+  codeql:
+    name: CodeQL analysis
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
