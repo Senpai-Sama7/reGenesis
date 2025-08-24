@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@9.7.0",
-  "engines": { "node": ">=20.0.0" },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -12,18 +14,26 @@
   "scripts": {
     "build": "pnpm run build:tokens && pnpm run build:packages",
     "build:tokens": "pnpm --filter @cyberarchitect/design-tokens build && pnpm --filter @cyberarchitect/motion-tokens build",
-    "build:packages": "pnpm -r --filter \"./packages/*\" --parallel=false run build",
+    "build:packages": "pnpm -r --filter "./packages/*" --parallel=false run build",
     "dev": "pnpm --filter @cyberarchitect/site-example dev",
     "app:build": "pnpm --filter @cyberarchitect/site-example build",
     "app:start": "pnpm --filter @cyberarchitect/site-example start",
     "generate": "node tools/generate.mjs",
     "replicate": "node tools/replicator.mjs replicate",
-    "verify": "node tools/replicator.mjs verify"
+    "verify": "node tools/replicator.mjs verify",
+    "test": "node --test packages/testing/*.mjs",
+    "test:e2e": "playwright test",
+    "lint": "eslint . --ext .js,.cjs,.mjs,.ts,.tsx --max-warnings 0",
+    "format": "prettier -w .",
+    "format:check": "prettier -c ."
   },
   "dependencies": {
     "ajv": "^8.17.1",
     "ajv-formats": "^2.1.1",
     "cheerio": "^1.0.0-rc.12",
+    "cosmiconfig": "^9.0.0",
+    "csso": "^5.0.5",
+    "html-minifier-terser": "^7.2.0",
     "p-queue": "^8.0.1",
     "pino": "^9.3.2",
     "pino-pretty": "^10.0.0",
@@ -38,7 +48,12 @@
   },
   "devDependencies": {
     "tsup": "^8.0.2",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "@playwright/test": "^1.47.1",
+    "eslint": "^8.57.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.3.3"
   }
 }
-
