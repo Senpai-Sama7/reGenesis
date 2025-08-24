@@ -676,7 +676,11 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     return path.join(safeDirname, `${safeBasename}${queryHash}${ext}`);
   }
   resolveOutputPath(p){
-    const normalized = path.normalize(p).replace(/^([.][.][/\\])+/, '').replace(/^[/\\]+/, '');
+    const isWindowsAbs = /^[a-zA-Z]:[\\/]/.test(p);
+    if (path.isAbsolute(p) || isWindowsAbs) {
+      throw new Error(`Path traversal attempt blocked: ${p}`);
+    }
+    const normalized = path.normalize(p).replace(/^([.][.][/\\])+/, '');
     let outputCanonical;
     try {
       outputCanonical = fss.realpathSync.native ? fss.realpathSync.native(this.state.outputDir) : fss.realpathSync(this.state.outputDir);
