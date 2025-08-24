@@ -9,7 +9,7 @@ jobs:
   osv:
     runs-on: [self-hosted, linux, x64, docker]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: google/osv-scanner-action@v1
         with:
           scan-args: -r .
