@@ -1,4 +1,3 @@
-
 #!/usr/bin/env node
 /**
  * Website Replicator + Verifier + Brand Generator bridge
@@ -11,13 +10,14 @@ import path from "node:path";
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import os from "node:os";
 import zlib from "node:zlib";
 
 import puppeteer from "puppeteer";
 import puppeteerExtra from "puppeteer-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 import sharp from "sharp";
 import PQueue from "p-queue";
 import { optimize as optimizeSvg } from "svgo";
@@ -180,6 +180,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       urlToLocalPath: new Map(),
       crawledUrls: new Set(),
       failedUrls: new Set(),
+      pendingAssets: new Set(),
       robots: null,
       baseUrl: '',
       outputDir: '',
@@ -316,7 +317,11 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       const etag = res.headers().etag;
       const lastModified = res.headers()['last-modified'];
 
-      for (const assetUrl of discovered){ this.captureAsset(assetUrl); }
+      for (const assetUrl of discovered){
+        const localPath = this.getLocalPathForUrl(assetUrl);
+        this.state.urlToLocalPath.set(assetUrl, localPath);
+        this.captureAsset(assetUrl);
+      }
 
       const rewritten = this.htmlProcessor.rewriteUrls(html, (u) => this.rewriteUrl(u, pageUrl), this.cssProcessor);
       const localPath = this.getLocalPathForUrl(pageUrl);
@@ -360,19 +365,25 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     return this.state.circuitBreakers.get(domain);
   }
   captureAsset(assetUrl){
+    const localPath = this.getLocalPathForUrl(assetUrl);
+    if (this.state.manifest.assets[localPath] || this.state.failedUrls.has(assetUrl) || this.state.pendingAssets.has(assetUrl)) return;
+    this.state.pendingAssets.add(assetUrl);
     const domain = new URL(assetUrl).hostname;
     const q = this.getQueueForDomain(domain);
     const cb = this.getCircuitBreakerForDomain(domain);
     q.add(() => this.fetchAndProcessAsset(assetUrl, cb));
   }
   async fetchAndProcessAsset(assetUrl, circuitBreaker){
-    if (this.state.urlToLocalPath.has(assetUrl) || this.state.failedUrls.has(assetUrl)) return;
+    const localPath = this.getLocalPathForUrl(assetUrl);
+    if (this.state.manifest.assets[localPath] || this.state.failedUrls.has(assetUrl)){
+      this.state.pendingAssets.delete(assetUrl);
+      return;
+    }
     for (let attempt=0; attempt <= this.options.maxRetries; attempt++){
       try{
         return await circuitBreaker.execute(async () => {
           const headers = {};
-          const localPathForCheck = this.getLocalPathForUrl(assetUrl);
-          const existing = this.state.manifest.assets[localPathForCheck];
+          const existing = this.state.manifest.assets[localPath];
           if (this.options.incremental && existing?.etag) headers['If-None-Match'] = existing.etag;
           if (this.options.incremental && existing?.lastModified) headers['If-Modified-Since'] = existing.lastModified;
           const res = await fetch(assetUrl, { headers });
@@ -381,27 +392,31 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const contentType = res.headers.get('content-type') || '';
           const isText = /^(text\/|application\/(javascript|json|xml))/.test(contentType);
           const useBrotli = this.options.enableBrotli && isText;
-          const localPath = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
-          const full = path.join(this.state.outputDir, localPath);
+          const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
+          const full = path.join(this.state.outputDir, localPathBrotli);
           await fs.mkdir(path.dirname(full), { recursive: true });
 
-          const { Transform } = await import('node:stream');
           const optimizationStream = this.getOptimizationStream(contentType);
           const compressionStream = useBrotli ? zlib.createBrotliCompress() : null;
+          const hash = crypto.createHash('sha256');
+          let bytes = 0;
+          const hashStream = new Transform({
+            transform(chunk, enc, cb){ hash.update(chunk); bytes += chunk.length; cb(null, chunk); }
+          });
           const writeStream = fss.createWriteStream(full);
 
-          const streams = [res.body, optimizationStream, compressionStream, writeStream].filter(Boolean);
+          const streams = [res.body, optimizationStream, compressionStream, hashStream, writeStream].filter(Boolean);
           await pipeline(streams);
 
-          const finalBuffer = await fs.readFile(full);
-          const hash = crypto.createHash('sha256').update(finalBuffer).digest('hex');
-          this.state.urlToLocalPath.set(assetUrl, localPath);
-          this.state.manifest.assets[localPath] = {
-            originalUrl: assetUrl, contentType, size: finalBuffer.length, integrity: `sha256-${hash}`,
+          const integrity = `sha256-${hash.digest('hex')}`;
+          this.state.urlToLocalPath.set(assetUrl, localPathBrotli);
+          this.state.manifest.assets[localPathBrotli] = {
+            originalUrl: assetUrl, contentType, size: bytes, integrity,
             etag: res.headers.get('etag'), lastModified: res.headers.get('last-modified')
           };
-          this.stats.totalAssets++; this.stats.totalSize += finalBuffer.length;
-          logger.info({ path: localPath, size: `${(finalBuffer.length/1024).toFixed(2)} KB` }, 'Asset captured');
+          this.stats.totalAssets++; this.stats.totalSize += bytes;
+          this.state.pendingAssets.delete(assetUrl);
+          logger.info({ path: localPathBrotli, size: `${(bytes/1024).toFixed(2)} KB` }, 'Asset captured');
         });
       } catch (e){
         logger.warn({ url: assetUrl, attempt: attempt+1, err: e.message }, 'Asset download failed');
@@ -411,13 +426,13 @@ export class UltimateWebsiteReplicator extends EventEmitter {
         } else {
           logger.error({ url: assetUrl }, 'Asset failed after all retries');
           this.state.failedUrls.add(assetUrl); this.stats.failedAssets++;
+          this.state.pendingAssets.delete(assetUrl);
         }
       }
     }
   }
 
   getOptimizationStream(contentType){
-    const { Transform } = require('stream'); // will fallback if import not available
     if (this.options.optimizeImages && contentType.startsWith('image/')){
       if (contentType.includes('svg')){
         return new Transform({

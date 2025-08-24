@@ -12,7 +12,7 @@ export function reduced(){
 
 export function initLenis(opts: { smooth?: boolean; duration?: number } = {}){
   if (typeof window === "undefined" || reduced()) return null;
-  const lenis = new Lenis({ duration: Math.max(0.6, Math.min(2, (opts.duration ?? 1.2))), smooth: opts.smooth ?? true });
+  const lenis = new Lenis({ duration: Math.max(0.6, Math.min(2, (opts.duration ?? 1.2))), smooth: opts.smooth ?? true } as any);
   function raf(time: number){ lenis.raf(time); requestAnimationFrame(raf); }
   requestAnimationFrame(raf);
   return lenis;

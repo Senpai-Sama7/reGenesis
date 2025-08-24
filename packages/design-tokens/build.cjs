@@ -1,4 +1,3 @@
-
 #!/usr/bin/env node
 const fs = require('fs').promises;
 const path = require('path');
@@ -44,10 +43,13 @@ async function build(){
   const { cssVars, tsConstants } = transformTokens(tokens);
   const css = `:root {\n${Object.entries(cssVars).map(([k,v]) => `  ${k}: ${v};`).join('\n')}\n}`;
   const ts = `export const tokens = ${JSON.stringify(tsConstants, null, 2)} as const;\n`;
+  const js = `export const tokens = ${JSON.stringify(tsConstants, null, 2)};\n`;
   const dist = path.join(__dirname, 'dist');
   await fs.mkdir(dist, { recursive: true });
   await fs.writeFile(path.join(dist, 'tokens.css'), css, 'utf8');
   await fs.writeFile(path.join(dist, 'tokens.ts'), ts, 'utf8');
+  await fs.writeFile(path.join(dist, 'tokens.d.ts'), ts, 'utf8');
+  await fs.writeFile(path.join(dist, 'tokens.js'), js, 'utf8');
   console.log('built', Object.keys(cssVars).length, 'vars');
 }
 build().catch(e => { console.error(e); process.exit(1); });

@@ -2,7 +2,8 @@
   "name": "@cyberarchitect/motion",
   "version": "1.0.0",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "dependencies": {
     "framer-motion": "^11.2.6",
@@ -17,6 +18,13 @@
   },
   "scripts": {
     "build": "tsup"
+  },
+  "exports": {
+    ".": {
+      "require": "./dist/index.cjs",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
   },
   "license": "MIT"
 }
