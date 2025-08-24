@@ -6,14 +6,66 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
-    runs-on: self-hosted
+  audit:
+    runs-on: [self-hosted, linux, x64, docker]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v2
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
         with:
-          version: 9
-      - uses: actions/setup-node@v4
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm i -g pnpm
+
+      - name: Run local audit script
+        run: node tools/local-audit.mjs
+
+  build-and-test:
+    runs-on: [self-hosted, linux, x64, docker]
+    needs: [audit]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm i -g pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run build script
+        run: pnpm run build
+
+      - name: Run unit and CLI tests
+        run: pnpm run test
+
+      - name: Run E2E tests
+        run: |
+          npx playwright install --with-deps
+          pnpm run test:e2e
+      
+      - name: Test generator dry-run
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: pnpm run generate -- --brief ./packages/schemas/examples/brand-brief.example.json --outputDir ./out --dry-run
+      
+  security:
+    runs-on: [self-hosted, linux, x64, docker]
+    needs: [build-and-test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'pnpm'

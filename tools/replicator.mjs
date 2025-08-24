@@ -8,13 +8,14 @@ import fs from "node:fs/promises";
 import fss from "node:fs";
 import path from "node:path";
 import { URL } from "node:url";
+import net from "node:net";
+import { performance } from "node:perf_hooks";
 import crypto from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import os from "node:os";
 import zlib from "node:zlib";
 
-import puppeteer from "puppeteer";
 import puppeteerExtra from "puppeteer-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
 import * as cheerio from "cheerio";
@@ -37,6 +38,202 @@ if (!globalThis.fetch) {
 
 puppeteerExtra.use(stealth());
 const logger = pino({ transport: { target: 'pino-pretty' } });
+
+class ReplicationError extends Error {
+  constructor(message, context = {}) {
+    super(message);
+    this.name = 'ReplicationError';
+    this.context = context;
+    this.timestamp = new Date().toISOString();
+  }
+  toJSON() {
+    return {
+      name: this.name,
+      message: this.message,
+      context: this.context,
+      timestamp: this.timestamp,
+      stack: this.stack
+    };
+  }
+}
+
+class ReplicationTelemetry {
+  constructor() {
+    this.metrics = {
+      assetsProcessed: new Map(),
+      averageProcessingTime: new Map(),
+      errorRates: new Map(),
+      memoryUsage: [],
+      bandwidthUtilization: []
+    };
+  }
+  recordAssetProcessing(domain, duration, size) {
+    const key = `${domain}_processing`;
+    if (!this.metrics.assetsProcessed.has(key)) {
+      this.metrics.assetsProcessed.set(key, []);
+    }
+    this.metrics.assetsProcessed.get(key).push({ duration, size, timestamp: Date.now() });
+  }
+  recordMemoryUsage(usage) {
+    this.metrics.memoryUsage.push({ usage, timestamp: Date.now() });
+  }
+}
+
+class AdaptiveQueue extends PQueue {
+  constructor(options) {
+    super(options);
+    this.adaptiveConcurrency = options?.concurrency || 1;
+    this._durations = [];
+  }
+  async add(fn, options) {
+    const start = performance.now();
+    try {
+      const result = await super.add(fn, options);
+      return result;
+    } finally {
+      const duration = performance.now() - start;
+      this._durations.push(duration);
+      if (this._durations.length > 50) this._durations.shift();
+      this._adaptConcurrency();
+    }
+  }
+  _avgLatency() {
+    if (this._durations.length === 0) return 0;
+    return this._durations.reduce((a, b) => a + b, 0) / this._durations.length;
+  }
+  _getMemoryPressure() {
+    const used = process.memoryUsage().heapUsed;
+    const total = os.totalmem();
+    return used / total;
+  }
+  _adaptConcurrency() {
+    const avg = this._avgLatency();
+    const pressure = this._getMemoryPressure();
+    if (avg > 5000 || pressure > 0.8) {
+      this.concurrency = Math.max(1, (this.concurrency || 1) - 1);
+    } else if (avg < 1000 && pressure < 0.5) {
+      const base = this.adaptiveConcurrency || 1;
+      this.concurrency = Math.min(10, (this.concurrency || base) + 1);
+    }
+  }
+}
+
+class CSSProcessor {
+  rewriteUrls(cssContent, urlRewriter) {
+    const urlPattern = /url\s*\(\s*(['"]?)([^'")]+?)\1\s*\)/gi;
+    return cssContent.replace(urlPattern, (match, quote, originalUrl) => {
+      if (!originalUrl || originalUrl.startsWith('data:')) return match;
+      const rewrittenUrl = urlRewriter(originalUrl);
+      return `url(${quote}${rewrittenUrl}${quote})`;
+    });
+  }
+  minify(cssContent) {
+    return cssContent
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/;\s*}/g, '}')
+      .replace(/,\s+/g, ',')
+      .replace(/:\s+/g, ':')
+      .trim();
+  }
+}
+
+class HTMLProcessor {
+  constructor(){
+    this.urlAttributes = new Map([
+      ['img', ['src', 'srcset']], ['source', ['src', 'srcset']],
+      ['link', ['href']], ['script', ['src']],
+      ['video', ['src', 'poster']], ['audio', ['src']],
+      ['iframe', ['src']], ['form', ['action']],
+    ]);
+  }
+  processSrcset(srcsetValue, urlRewriter) {
+    if (!srcsetValue) return '';
+    return srcsetValue.split(',').map(part => {
+      const [url, descriptor] = part.trim().split(/\s+/);
+      return `${urlRewriter(url)} ${descriptor || ''}`.trim();
+    }).join(', ');
+  }
+  rewriteUrls(htmlContent, urlRewriter, cssProcessor) {
+    const $ = cheerio.load(htmlContent, { decodeEntities: false });
+    this.urlAttributes.forEach((attrs, tag) => {
+      $(tag).each((_, el) => {
+        const $el = $(el);
+        for (const attr of attrs){
+          const val = $el.attr(attr);
+          if (!val) continue;
+          if (attr.includes('srcset')) $el.attr(attr, this.processSrcset(val, urlRewriter));
+          else $el.attr(attr, urlRewriter(val));
+        }
+      });
+    });
+    $('[style]').each((_, el) => {
+      const $el = $(el);
+      const style = $el.attr('style') || '';
+      $el.attr('style', cssProcessor.rewriteUrls(style, urlRewriter));
+    });
+    $('style').each((_, el) => {
+      const $el = $(el);
+      const css = $el.html() || '';
+      $el.html(cssProcessor.rewriteUrls(css, urlRewriter));
+    });
+    return $.html();
+  }
+}
+
+class AdvancedCircuitBreaker extends EventEmitter {
+  constructor(opts = {}){
+    super();
+    this.failureThreshold = opts.failureThreshold ?? 5;
+    this.successThreshold = opts.successThreshold ?? 3;
+    this.timeout = opts.timeout ?? 30000;
+    this.retryTimeoutBase = opts.retryTimeoutBase ?? 1000;
+    this.state = 'CLOSED';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = Date.now();
+    this._transitionLock = Promise.resolve();
+  }
+  async execute(operation){
+    if (this.state === 'OPEN'){
+      await (this._transitionLock = this._transitionLock.then(async () => {
+        if (this.state === 'OPEN'){
+          if (Date.now() < this.nextAttempt) throw new Error('Circuit breaker is OPEN.');
+          this.state = 'HALF_OPEN';
+          this.successCount = 0;
+        }
+      }));
+    }
+    try{
+      const result = await Promise.race([
+        operation(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Operation timed out.')), this.timeout))
+      ]);
+      this.onSuccess(); return result;
+    } catch (e){
+      this.onFailure(); throw e;
+    }
+  }
+  onSuccess(){
+    this.failureCount = 0;
+    if (this.state === 'HALF_OPEN'){
+      this.successCount++;
+      if (this.successCount >= this.successThreshold){ this.state = 'CLOSED'; this.emit('close'); }
+    } else { this.state = 'CLOSED'; }
+    this.emit('success');
+  }
+  onFailure(){
+    this.failureCount++;
+    if (this.state === 'HALF_OPEN' || this.failureCount >= this.failureThreshold){
+      this.state = 'OPEN';
+      const exponent = this.failureCount - this.failureThreshold;
+      const wait = this.retryTimeoutBase * Math.pow(2, Math.max(0, exponent));
+      this.nextAttempt = Date.now() + wait;
+      this.emit('open');
+    }
+    this.emit('failure');
+  }
+}
 
 export class UltimateWebsiteReplicator extends EventEmitter {
   constructor(options = {}){
@@ -68,9 +265,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       optimizationPlugins: [],
     }, options);
 
-    this.pageQueue = new PQueue({ concurrency: this.options.pageConcurrency });
+    this.pageQueue = new AdaptiveQueue({ concurrency: this.options.pageConcurrency });
     this.cssProcessor = new CSSProcessor();
     this.htmlProcessor = new HTMLProcessor();
+    this.telemetry = new ReplicationTelemetry();
 
     this.state = {
       browser: null,
@@ -100,17 +298,25 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     logger.info('Browser initialized.');
   }
 
-  startMemoryMonitor(){
+  startMemoryMonitor(intervalMs = 5000){
     this.state.memoryMonitor = setInterval(() => {
-      const { heapUsed, heapTotal } = process.memoryUsage();
-      const usage = heapUsed / heapTotal;
+      const usage = process.memoryUsage().heapUsed / os.totalmem();
+      this.telemetry.recordMemoryUsage(usage);
       if (usage > this.options.memoryThreshold){
-        logger.warn({ usage }, 'Memory threshold exceeded; throttling queues');
-        this.pauseQueues();
+        logger.warn({ usage }, 'Memory threshold exceeded. Pausing queues.');
+        try { this.pageQueue.pause(); } catch (e) { void e; }
+        for (const q of this.state.domainQueues.values()){
+          try { q.pause(); } catch (e) { void e; }
+        }
         if (global.gc){ logger.info('Forcing GC.'); global.gc(); }
-        setTimeout(() => this.resumeQueues(), 5000);
+      } else {
+        // Resume if previously paused
+        try { this.pageQueue.start(); } catch (e) { void e; }
+        for (const q of this.state.domainQueues.values()){
+          try { q.start(); } catch (e) { void e; }
+        }
       }
-    }, 15000);
+    }, intervalMs);
   }
 
   pauseQueues(){
@@ -180,12 +386,16 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     if (this.options.respectRobotsTxt){
       try{
         const robotsUrl = new URL('/robots.txt', this.state.baseUrl).href;
-        const res = await fetch(robotsUrl);
-        if (res.ok){
-          const txt = await res.text();
-          this.state.robots = robotsParser(robotsUrl, txt);
-          const sitemaps = this.state.robots.getSitemaps();
-          for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
+        if (this.isUrlFetchSafe(robotsUrl)){
+          const res = await fetch(robotsUrl);
+          if (res.ok){
+            const txt = await res.text();
+            this.state.robots = robotsParser(robotsUrl, txt);
+            const sitemaps = this.state.robots.getSitemaps();
+            for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
+          }
+        } else {
+          logger.warn({ url: robotsUrl }, 'Blocked robots.txt by SSRF policy');
         }
       } catch (e){ logger.warn({ e: e.message }, 'robots.txt unavailable'); }
     }
@@ -196,6 +406,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async parseSitemap(sitemapUrl, urlSet){
     try{
+      if (!this.isUrlFetchSafe(sitemapUrl)) { logger.warn({ url: sitemapUrl }, 'Blocked sitemap URL by SSRF policy'); return; }
       const res = await fetch(sitemapUrl);
       if (!res.ok) return;
       const xml = await res.text();
@@ -211,6 +422,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
   }
 
   async processPage(pageUrl, depth){
+    if (!this.isUrlFetchSafe(pageUrl)) { logger.warn({ url: pageUrl }, 'Blocked page by SSRF policy'); return; }
     if (depth > this.options.maxCrawlDepth) return;
     if (this.options.respectRobotsTxt && this.state.robots && !this.state.robots.isAllowed(pageUrl, this.options.userAgent)){
       logger.warn({ url: pageUrl }, 'Disallowed by robots.txt'); return;
@@ -279,7 +491,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       const qOpts = { concurrency };
       if (this.options.requestInterval){ qOpts.intervalCap = 1; qOpts.interval = this.options.requestInterval; }
       logger.info({ domain, concurrency, interval: this.options.requestInterval }, 'Creating domain queue');
-      this.state.domainQueues.set(domain, new PQueue(qOpts));
+      this.state.domainQueues.set(domain, new AdaptiveQueue(qOpts));
     }
     return this.state.domainQueues.get(domain);
   }
@@ -312,6 +524,9 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       let full;
       try{
         return await circuitBreaker.execute(async () => {
+          if (!this.isUrlFetchSafe(assetUrl)){
+            throw new ReplicationError('URL blocked by SSRF policy', { url: assetUrl });
+          }
           const headers = {};
           const existing = this.state.manifest.assets[localPath];
           if (this.options.incremental && existing?.etag) headers['If-None-Match'] = existing.etag;
@@ -328,8 +543,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
           const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
           full = this.resolveOutputPath(localPathBrotli);
           await fs.mkdir(path.dirname(full), { recursive: true });
-
-          const optimizationStreams = createOptimizationPipeline(contentType, this.options, this.cssProcessor, this.options.optimizationPlugins);
+          const { stream: optimizationStream, cleanup: optimizationCleanup } = this.createOptimizationStream(contentType);
           const compressionStream = useBrotli ? zlib.createBrotliCompress() : null;
           const hash = crypto.createHash('sha256');
           let bytes = 0;
@@ -341,11 +555,14 @@ export class UltimateWebsiteReplicator extends EventEmitter {
             }
           });
           const writeStream = fss.createWriteStream(full);
-
-          const streams = [res.body, ...optimizationStreams, compressionStream, hashStream, writeStream].filter(Boolean);
-          const dlStart = Date.now();
-          await pipeline(streams);
-          this.stats.totalDownloadTime += Date.now() - dlStart;
+          const streams = [res.body, optimizationStream, compressionStream, hashStream, writeStream].filter(Boolean);
+          const start = performance.now();
+          try {
+            await pipeline(streams);
+          } finally {
+            try { if (optimizationCleanup) optimizationCleanup(); } catch (e) { void e; }
+          }
+          const duration = performance.now() - start;
 
           const integrity = `sha256-${hash.digest('hex')}`;
           this.state.urlToLocalPath.set(assetUrl, localPathBrotli);
@@ -354,6 +571,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
             etag: res.headers.get('etag'), lastModified: res.headers.get('last-modified')
           };
           this.stats.totalAssets++; this.stats.totalSize += bytes;
+          try { this.telemetry.recordAssetProcessing(new URL(assetUrl).hostname, duration, bytes); } catch (e) { void e; }
           this.state.pendingAssets.delete(assetUrl);
           logger.info({ path: localPathBrotli, size: `${(bytes/1024).toFixed(2)} KB` }, 'Asset captured');
         });
@@ -372,6 +590,32 @@ export class UltimateWebsiteReplicator extends EventEmitter {
         }
       }
     }
+  }
+
+  createOptimizationStream(contentType){
+    if (this.options.optimizeImages && contentType.startsWith('image/')){
+      if (contentType.includes('svg')){
+        const s = new Transform({
+          readableHighWaterMark: 1 << 20,
+          writableHighWaterMark: 1 << 20,
+          construct(){ this._chunks = []; },
+          transform(chunk, _enc, cb){ this._chunks.push(chunk); cb(); },
+          flush(cb){ 
+            const buf = Buffer.concat(this._chunks);
+            try { this.push(Buffer.from(optimizeSvg(buf.toString()).data)); }
+            catch(e){ this.push(buf); }
+            cb();
+          }
+        });
+        return { stream: s, cleanup: null };
+      }
+      const s = sharp();
+      if (this.options.enableAVIF) s.avif({ quality: 75 }); else s.webp({ quality: 80 });
+      const cleanup = () => { try { s.destroy(); } catch {} };
+      return { stream: s, cleanup };
+    }
+    const passthrough = new Transform({ transform(chunk, _enc, cb){ cb(null, chunk); } });
+    return { stream: passthrough, cleanup: null };
   }
 
   async captureScreenshot(page, pageUrl, bp){
@@ -452,7 +696,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       try{
         const abs = new URL(href, baseUrl).href.split('#')[0];
         if (abs.startsWith(this.state.baseUrl)) links.add(abs);
-      } catch {}
+      } catch (e) { void e; }
     });
     return Array.from(links);
   }
@@ -461,7 +705,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     try{
       const abs = new URL(originalUrl, baseUrl).href;
       if (this.state.urlToLocalPath.has(abs)) return this.state.urlToLocalPath.get(abs);
-    } catch {}
+    } catch (e) { void e; }
     return originalUrl;
   }
   getLocalPathForUrl(assetUrl){
@@ -476,15 +720,65 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     return path.join(safeDirname, `${safeBasename}${queryHash}${ext}`);
   }
   resolveOutputPath(p){
-    const full = path.resolve(this.state.outputDir, p);
-    if (!full.startsWith(this.state.outputDir + path.sep)) throw new RegenesisError(ERROR_CODES.PATH_TRAVERSAL, `Path traversal: ${p}`);
+    const isWindowsAbs = /^[a-zA-Z]:[\\/]/.test(p);
+    const hasTraversal = /(^|[\\/])\.\.([\\/]|$)/.test(p);
+    if (path.isAbsolute(p) || isWindowsAbs || hasTraversal) {
+      throw new Error(`Path traversal attempt blocked: ${p}`);
+    }
+    const normalized = path.normalize(p).replace(/^([.][.][/\\])+/, '');
+    let outputCanonical;
+    try {
+      outputCanonical = fss.realpathSync.native ? fss.realpathSync.native(this.state.outputDir) : fss.realpathSync(this.state.outputDir);
+    } catch {
+      outputCanonical = path.resolve(this.state.outputDir);
+    }
+    const full = path.resolve(outputCanonical, normalized);
+    const rel = path.relative(outputCanonical, full);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error(`Path traversal attempt blocked: ${p}`);
     return full;
+  }
+
+  // --- Security helpers ---
+  isUrlFetchSafe(u) {
+    try {
+      const url = new URL(u);
+      if (!['http:', 'https:'].includes(url.protocol)) return false;
+      const host = url.hostname || '';
+      const ipType = net.isIP(host);
+      if (ipType) {
+        if (this._isPrivateIp(host)) return false;
+      }
+      const lowered = host.toLowerCase();
+      if (lowered === 'localhost' || lowered.endsWith('.localhost') || lowered.endsWith('.local')) return false;
+      if (lowered === '127.0.0.1' || lowered === '::1') return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  _isPrivateIp(ip) {
+    if (ip.includes(':')) { // IPv6 (simple checks)
+      const lower = ip.toLowerCase();
+      if (lower === '::1') return true; // loopback
+      if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // unique local fc00::/7
+      if (lower.startsWith('fe80:')) return true; // link-local
+      return false;
+    }
+    const parts = ip.split('.').map(n => parseInt(n, 10));
+    if (parts.length !== 4 || parts.some(n => Number.isNaN(n) || n < 0 || n > 255)) return false;
+    const [a, b] = parts;
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 127) return true; // 127.0.0.0/8
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    return false;
   }
 }
 
 // --- CLI ---
 async function main(){
-  const argv = yargs(hideBin(process.argv))
+  yargs(hideBin(process.argv))
     .command('replicate <url> [outputDir]', 'Replicate a website', (y) => {
       y.positional('url', { type: 'string', demandOption: true })
        .positional('outputDir', { type: 'string', default: './replicated-site' })
