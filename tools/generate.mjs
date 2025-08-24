@@ -1,4 +1,3 @@
-
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import fss from "node:fs";
@@ -6,6 +5,8 @@ import path from "node:path";
 import process from "node:process";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
+import yargs from "yargs/yargs";
+import { hideBin } from "yargs/helpers";
 
 if (!globalThis.fetch) {
   const { fetch, Request, Response, Headers } = await import("undici");
@@ -39,12 +40,12 @@ function fontLink(identity){
 export async function requestGemini({ model, prompt, timeout = 30000 }){
   const key = process.env.GEMINI_API_KEY;
   if (!key) { console.error("GEMINI_API_KEY is required"); process.exit(1); }
-  const controller = new AbortController();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
   const body = { contents: [{ parts: [{ text: prompt }]}], generationConfig: { temperature: 0, topK: 1, topP: 0.9 } };
   const retries = [500, 1000, 2000];
   let lastErr = null;
   for (let i=0;i<retries.length+1;i++){
+    const controller = new AbortController();
     try {
       const t = setTimeout(() => controller.abort(), timeout);
       const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal });
@@ -95,30 +96,20 @@ export async function synthesizeMotion(brief, { model = "gemini-2.5-flash-previe
   return await requestGemini({ model, prompt, timeout });
 }
 
-function parseArgs(argv){
-  const args = {};
-  for (let i=0;i<argv.length;i++){
-    const a = argv[i];
-    if (a.startsWith("--")){
-      const k = a.slice(2);
-      const v = (i+1 < argv.length && !argv[i+1].startsWith("--")) ? argv[i+1] : true;
-      args[k] = v;
-    }
-  }
-  return args;
-}
-
 async function main(){
-  const args = parseArgs(process.argv.slice(2));
-  const briefPath = args["brief"];
-  const outputDir = args["outputDir"];
-  const model = args["model"] || "gemini-2.5-flash-preview-0514";
-  const dry = !!args["dry-run"];
-  const force = !!args["force"];
-  if (!briefPath || !outputDir){
-    console.error("Usage: node tools/generate.mjs --brief <path> --outputDir <dir> [--model <model>] [--force] [--dry-run]");
-    process.exit(1);
-  }
+  const argv = yargs(hideBin(process.argv))
+    .option('brief', { type: 'string', demandOption: true, describe: 'Path to brand brief JSON' })
+    .option('outputDir', { type: 'string', demandOption: true, describe: 'Output directory' })
+    .option('model', { type: 'string', default: 'gemini-2.5-flash-preview-0514' })
+    .option('force', { type: 'boolean', default: false })
+    .option('dry-run', { type: 'boolean', default: false })
+    .help()
+    .parse();
+  const briefPath = argv.brief;
+  const outputDir = argv.outputDir;
+  const model = argv.model;
+  const dry = argv['dry-run'];
+  const force = argv.force;
   let brief;
   try{
     brief = JSON.parse(await fs.readFile(path.resolve(briefPath), "utf8"));

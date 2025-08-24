@@ -5,15 +5,18 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "next build && next export",
-    "start": "next start"
+    "build": "next build",
+    "start": "serve out"
   },
   "dependencies": {
     "next": "14.2.5",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "@cyberarchitect/ui": "1.0.0",
-    "@cyberarchitect/motion": "1.0.0",
-    "@cyberarchitect/scroll": "1.0.0"
+    "@cyberarchitect/ui": "workspace:*",
+    "@cyberarchitect/motion": "workspace:*",
+    "@cyberarchitect/scroll": "workspace:*"
+  },
+  "devDependencies": {
+    "serve": "^14.2.0"
   }
 }

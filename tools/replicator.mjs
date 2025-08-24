@@ -1,4 +1,3 @@
-
 #!/usr/bin/env node
 /**
  * Website Replicator + Verifier + Brand Generator bridge
@@ -11,20 +10,25 @@ import path from "node:path";
 import { URL } from "node:url";
 import crypto from "node:crypto";
 import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import os from "node:os";
 import zlib from "node:zlib";
 
 import puppeteer from "puppeteer";
 import puppeteerExtra from "puppeteer-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
-import cheerio from "cheerio";
-import sharp from "sharp";
+import * as cheerio from "cheerio";
 import PQueue from "p-queue";
-import { optimize as optimizeSvg } from "svgo";
 import pino from "pino";
 import yargs from "yargs/yargs";
 import { hideBin } from "yargs/helpers";
 import robotsParser from "robots-parser";
+import { CSSProcessor } from "./lib/replicator/css-processor.mjs";
+import { HTMLProcessor } from "./lib/replicator/html-processor.mjs";
+import { AdvancedCircuitBreaker } from "./lib/replicator/advanced-circuit-breaker.mjs";
+import { createOptimizationPipeline } from "./lib/replicator/optimization-pipeline.mjs";
+import { cosmiconfig } from "cosmiconfig";
+import { RegenesisError, ERROR_CODES } from "./lib/errors.mjs";
 
 if (!globalThis.fetch) {
   const { fetch, Request, Response, Headers } = await import("undici");
@@ -33,117 +37,6 @@ if (!globalThis.fetch) {
 
 puppeteerExtra.use(stealth());
 const logger = pino({ transport: { target: 'pino-pretty' } });
-
-class CSSProcessor {
-  rewriteUrls(cssContent, urlRewriter) {
-    const urlPattern = /url\s*\(\s*(['"]?)([^'")]+?)\1\s*\)/gi;
-    return cssContent.replace(urlPattern, (match, quote, originalUrl) => {
-      if (!originalUrl || originalUrl.startsWith('data:')) return match;
-      const rewrittenUrl = urlRewriter(originalUrl);
-      return `url(${quote}${rewrittenUrl}${quote})`;
-    });
-  }
-  minify(cssContent) {
-    return cssContent
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/\s+/g, ' ')
-      .replace(/;\s*}/g, '}')
-      .replace(/,\s+/g, ',')
-      .replace(/:\s+/g, ':')
-      .trim();
-  }
-}
-
-class HTMLProcessor {
-  constructor(){
-    this.urlAttributes = new Map([
-      ['img', ['src', 'srcset']], ['source', ['src', 'srcset']],
-      ['link', ['href']], ['script', ['src']],
-      ['video', ['src', 'poster']], ['audio', ['src']],
-      ['iframe', ['src']], ['form', ['action']],
-    ]);
-  }
-  processSrcset(srcsetValue, urlRewriter) {
-    if (!srcsetValue) return '';
-    return srcsetValue.split(',').map(part => {
-      const [url, descriptor] = part.trim().split(/\s+/);
-      return `${urlRewriter(url)} ${descriptor || ''}`.trim();
-    }).join(', ');
-  }
-  rewriteUrls(htmlContent, urlRewriter, cssProcessor) {
-    const $ = cheerio.load(htmlContent, { decodeEntities: false });
-    this.urlAttributes.forEach((attrs, tag) => {
-      $(tag).each((_, el) => {
-        const $el = $(el);
-        for (const attr of attrs){
-          const val = $el.attr(attr);
-          if (!val) continue;
-          if (attr.includes('srcset')) $el.attr(attr, this.processSrcset(val, urlRewriter));
-          else $el.attr(attr, urlRewriter(val));
-        }
-      });
-    });
-    $('[style]').each((_, el) => {
-      const $el = $(el);
-      const style = $el.attr('style') || '';
-      $el.attr('style', cssProcessor.rewriteUrls(style, urlRewriter));
-    });
-    $('style').each((_, el) => {
-      const $el = $(el);
-      const css = $el.html() || '';
-      $el.html(cssProcessor.rewriteUrls(css, urlRewriter));
-    });
-    return $.html();
-  }
-}
-
-class AdvancedCircuitBreaker extends EventEmitter {
-  constructor(opts = {}){
-    super();
-    this.failureThreshold = opts.failureThreshold ?? 5;
-    this.successThreshold = opts.successThreshold ?? 3;
-    this.timeout = opts.timeout ?? 30000;
-    this.retryTimeoutBase = opts.retryTimeoutBase ?? 1000;
-    this.state = 'CLOSED';
-    this.failureCount = 0;
-    this.successCount = 0;
-    this.nextAttempt = Date.now();
-  }
-  async execute(operation){
-    if (this.state === 'OPEN'){
-      if (Date.now() < this.nextAttempt) throw new Error('Circuit breaker is OPEN.');
-      this.state = 'HALF_OPEN'; this.successCount = 0;
-    }
-    try{
-      const result = await Promise.race([
-        operation(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Operation timed out.')), this.timeout))
-      ]);
-      this.onSuccess(); return result;
-    } catch (e){
-      this.onFailure(); throw e;
-    }
-  }
-  onSuccess(){
-    this.failureCount = 0;
-    if (this.state === 'HALF_OPEN'){
-      this.successCount++;
-      if (this.successCount >= this.successThreshold){ this.state = 'CLOSED'; this.emit('close'); }
-    } else { this.state = 'CLOSED'; }
-    this.emit('success');
-  }
-  onFailure(){
-    this.failureCount++;
-    if (this.state === 'HALF_OPEN' || this.failureCount >= this.failureThreshold){
-      this.state = 'OPEN';
-      const exponent = this.failureCount - this.failureThreshold;
-      const wait = this.retryTimeoutBase * Math.pow(2, Math.max(0, exponent));
-      this.nextAttempt = Date.now() + wait;
-      this.emit('open');
-    }
-    this.emit('failure');
-  }
-}
 
 export class UltimateWebsiteReplicator extends EventEmitter {
   constructor(options = {}){
@@ -161,13 +54,18 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       crawlSPA: true,
       maxCrawlDepth: 2,
       respectRobotsTxt: true,
-      optimizeImages: true,
-      enableAVIF: true,
+      imagePolicy: 'avif', // 'avif' | 'webp' | 'none'
       minifyCSS: true,
+      minifyHTML: true,
       captureResponsive: false,
       responsiveBreakpoints: [{ name: 'mobile', width: 375, height: 812 }, { name: 'desktop', width: 1920, height: 1080 }],
-      enableBrotli: false,
+      compression: 'none', // 'none' | 'brotli'
       memoryThreshold: 0.85,
+      allowedDomains: [],
+      maxAssetSize: 5 * 1024 * 1024,
+      requestTimeout: 30000,
+      requestInterval: 0,
+      optimizationPlugins: [],
     }, options);
 
     this.pageQueue = new PQueue({ concurrency: this.options.pageConcurrency });
@@ -180,14 +78,16 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       urlToLocalPath: new Map(),
       crawledUrls: new Set(),
       failedUrls: new Set(),
+      pendingAssets: new Set(),
       robots: null,
       baseUrl: '',
       outputDir: '',
       memoryMonitor: null,
       domainQueues: new Map(),
       circuitBreakers: new Map(),
+      allowedDomains: new Set(),
     };
-    this.stats = { totalAssets: 0, totalSize: 0, crawledPages: 0, skippedAssets: 0, failedAssets: 0 };
+    this.stats = { totalAssets: 0, totalSize: 0, crawledPages: 0, skippedAssets: 0, failedAssets: 0, totalDownloadTime: 0 };
     ['SIGINT', 'SIGTERM'].forEach(sig => process.on(sig, () => this.shutdown()));
   }
 
@@ -200,14 +100,43 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     logger.info('Browser initialized.');
   }
 
+  logProgress(){
+    const { totalAssets, failedAssets, totalDownloadTime } = this.stats;
+    const successRate = totalAssets ? ((totalAssets - failedAssets) / totalAssets) * 100 : 100;
+    const avgLatency = totalAssets ? totalDownloadTime / totalAssets : 0;
+    const assetQueueDepth = Array.from(this.state.domainQueues.values())
+      .reduce((acc, q) => acc + q.size + q.pending, 0);
+    logger.debug({
+      totalAssets,
+      failedAssets,
+      successRate: Number(successRate.toFixed(2)),
+      avgLatency: Number(avgLatency.toFixed(2)),
+      pageQueueDepth: this.pageQueue.size + this.pageQueue.pending,
+      assetQueueDepth
+    }, 'Progress metrics');
+  }
+
   startMemoryMonitor(){
     this.state.memoryMonitor = setInterval(() => {
-      const usage = process.memoryUsage().heapUsed / os.totalmem();
+      const { heapUsed, heapTotal } = process.memoryUsage();
+      const usage = heapUsed / heapTotal;
       if (usage > this.options.memoryThreshold){
-        logger.warn({ usage }, 'Memory threshold exceeded.');
+        logger.warn({ usage }, 'Memory threshold exceeded; throttling queues');
+        this.pauseQueues();
         if (global.gc){ logger.info('Forcing GC.'); global.gc(); }
+        setTimeout(() => this.resumeQueues(), 5000);
       }
     }, 15000);
+  }
+
+  pauseQueues(){
+    this.pageQueue.pause();
+    for (const q of this.state.domainQueues.values()) q.pause();
+  }
+
+  resumeQueues(){
+    this.pageQueue.start();
+    for (const q of this.state.domainQueues.values()) q.start();
   }
 
   async shutdown(){
@@ -221,8 +150,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async replicate(targetUrl, outputDir){
     const start = Date.now();
+    this.stats.startTime = new Date().toISOString();
     this.state.baseUrl = new URL(targetUrl).origin;
     this.state.outputDir = path.resolve(outputDir);
+    this.state.allowedDomains = new Set([new URL(targetUrl).hostname, ...this.options.allowedDomains]);
     await fs.mkdir(this.state.outputDir, { recursive: true });
     logger.info({ options: this.options }, 'Replication starting');
 
@@ -244,8 +175,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
       await Promise.all(Array.from(this.state.domainQueues.values()).map(q => q.onIdle()));
       await this.generateManifest();
       const duration = (Date.now() - start) / 1000;
-      logger.info({ duration: `${duration.toFixed(2)}s`, stats: this.stats }, 'Replication complete');
-      this.emit('complete', { duration, stats: this.stats });
+      this.stats.endTime = new Date().toISOString();
+      const avg = this.stats.totalAssets ? this.stats.totalDownloadTime / this.stats.totalAssets : 0;
+      logger.info({ duration: `${duration.toFixed(2)}s`, avgLatency: `${avg.toFixed(2)}ms`, stats: this.stats }, 'Replication complete');
+      this.emit('complete', { duration, stats: this.stats, avgLatency: avg });
     } catch (e){
       logger.fatal(e, 'Fatal during replication');
       throw e;
@@ -256,16 +189,18 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async discoverInitialUrls(entryUrl){
     const urls = new Set([entryUrl]);
-    try{
-      const robotsUrl = new URL('/robots.txt', this.state.baseUrl).href;
-      const res = await fetch(robotsUrl);
-      if (res.ok){
-        const txt = await res.text();
-        this.state.robots = robotsParser(robotsUrl, txt);
-        const sitemaps = this.state.robots.getSitemaps();
-        for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
-      }
-    } catch (e){ logger.warn({ e: e.message }, 'robots.txt unavailable'); }
+    if (this.options.respectRobotsTxt){
+      try{
+        const robotsUrl = new URL('/robots.txt', this.state.baseUrl).href;
+        const res = await fetch(robotsUrl);
+        if (res.ok){
+          const txt = await res.text();
+          this.state.robots = robotsParser(robotsUrl, txt);
+          const sitemaps = this.state.robots.getSitemaps();
+          for (const sm of sitemaps){ await this.parseSitemap(sm, urls); }
+        }
+      } catch (e){ logger.warn({ e: e.message }, 'robots.txt unavailable'); }
+    }
     try{ await this.parseSitemap(new URL('/sitemap.xml', this.state.baseUrl).href, urls); }
     catch(e){ logger.warn('No default sitemap.xml'); }
     return urls;
@@ -289,7 +224,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
 
   async processPage(pageUrl, depth){
     if (depth > this.options.maxCrawlDepth) return;
-    if (this.state.robots && !this.state.robots.isAllowed(pageUrl, this.options.userAgent)){
+    if (this.options.respectRobotsTxt && this.state.robots && !this.state.robots.isAllowed(pageUrl, this.options.userAgent)){
       logger.warn({ url: pageUrl }, 'Disallowed by robots.txt'); return;
     }
     logger.info({ url: pageUrl, depth }, 'Processing page');
@@ -311,16 +246,21 @@ export class UltimateWebsiteReplicator extends EventEmitter {
         const u = r.url();
         if (r.ok() && !u.startsWith('data:')) discovered.add(u);
       });
-      await page.waitForTimeout(1000);
+      await page.waitForNetworkIdle({ idleTime: 500, timeout: this.options.timeout }).catch(() => {});
       let html = await page.content();
       const etag = res.headers().etag;
       const lastModified = res.headers()['last-modified'];
 
-      for (const assetUrl of discovered){ this.captureAsset(assetUrl); }
+      for (const assetUrl of discovered){
+        const localPath = this.getLocalPathForUrl(assetUrl);
+        this.state.urlToLocalPath.set(assetUrl, localPath);
+        this.captureAsset(assetUrl);
+      }
 
-      const rewritten = this.htmlProcessor.rewriteUrls(html, (u) => this.rewriteUrl(u, pageUrl), this.cssProcessor);
+      let rewritten = this.htmlProcessor.rewriteUrls(html, (u) => this.rewriteUrl(u, pageUrl), this.cssProcessor);
+      if (this.options.minifyHTML) rewritten = await this.htmlProcessor.minify(rewritten);
       const localPath = this.getLocalPathForUrl(pageUrl);
-      const full = path.join(this.state.outputDir, localPath);
+      const full = this.resolveOutputPath(localPath);
       await fs.mkdir(path.dirname(full), { recursive: true });
       await fs.writeFile(full, rewritten);
       const hash = crypto.createHash('sha256').update(rewritten).digest('hex');
@@ -348,8 +288,10 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     if (!this.state.domainQueues.has(domain)){
       const isBase = domain === new URL(this.state.baseUrl).hostname;
       const concurrency = isBase ? this.options.baseAssetConcurrency : this.options.domainAssetConcurrency;
-      logger.info({ domain, concurrency }, 'Creating domain queue');
-      this.state.domainQueues.set(domain, new PQueue({ concurrency }));
+      const qOpts = { concurrency };
+      if (this.options.requestInterval){ qOpts.intervalCap = 1; qOpts.interval = this.options.requestInterval; }
+      logger.info({ domain, concurrency, interval: this.options.requestInterval }, 'Creating domain queue');
+      this.state.domainQueues.set(domain, new PQueue(qOpts));
     }
     return this.state.domainQueues.get(domain);
   }
@@ -360,85 +302,90 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     return this.state.circuitBreakers.get(domain);
   }
   captureAsset(assetUrl){
+    const localPath = this.getLocalPathForUrl(assetUrl);
+    if (this.state.manifest.assets[localPath] || this.state.failedUrls.has(assetUrl) || this.state.pendingAssets.has(assetUrl)) return;
     const domain = new URL(assetUrl).hostname;
+    if (!this.state.allowedDomains.has(domain)){
+      logger.warn({ url: assetUrl }, 'Blocked by domain allowlist');
+      return;
+    }
+    this.state.pendingAssets.add(assetUrl);
     const q = this.getQueueForDomain(domain);
     const cb = this.getCircuitBreakerForDomain(domain);
     q.add(() => this.fetchAndProcessAsset(assetUrl, cb));
   }
   async fetchAndProcessAsset(assetUrl, circuitBreaker){
-    if (this.state.urlToLocalPath.has(assetUrl) || this.state.failedUrls.has(assetUrl)) return;
+    const localPath = this.getLocalPathForUrl(assetUrl);
+    if (this.state.manifest.assets[localPath] || this.state.failedUrls.has(assetUrl)){
+      this.state.pendingAssets.delete(assetUrl);
+      return;
+    }
     for (let attempt=0; attempt <= this.options.maxRetries; attempt++){
+      let full;
       try{
         return await circuitBreaker.execute(async () => {
           const headers = {};
-          const localPathForCheck = this.getLocalPathForUrl(assetUrl);
-          const existing = this.state.manifest.assets[localPathForCheck];
+          const existing = this.state.manifest.assets[localPath];
           if (this.options.incremental && existing?.etag) headers['If-None-Match'] = existing.etag;
           if (this.options.incremental && existing?.lastModified) headers['If-Modified-Since'] = existing.lastModified;
-          const res = await fetch(assetUrl, { headers });
+          const controller = new AbortController();
+          const t = setTimeout(() => controller.abort(), this.options.requestTimeout);
+          const res = await fetch(assetUrl, { headers, signal: controller.signal });
+          clearTimeout(t);
           if (res.status === 304){ logger.info({ url: assetUrl }, 'Asset 304'); this.stats.skippedAssets++; return; }
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          if (!res.ok) throw new RegenesisError(ERROR_CODES.FETCH_FAIL, `HTTP ${res.status}`);
           const contentType = res.headers.get('content-type') || '';
           const isText = /^(text\/|application\/(javascript|json|xml))/.test(contentType);
-          const useBrotli = this.options.enableBrotli && isText;
-          const localPath = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
-          const full = path.join(this.state.outputDir, localPath);
+          const useBrotli = this.options.compression === 'brotli' && isText;
+          const localPathBrotli = this.getLocalPathForUrl(assetUrl) + (useBrotli ? '.br' : '');
+          full = this.resolveOutputPath(localPathBrotli);
           await fs.mkdir(path.dirname(full), { recursive: true });
 
-          const { Transform } = await import('node:stream');
-          const optimizationStream = this.getOptimizationStream(contentType);
+          const optimizationStreams = createOptimizationPipeline(contentType, this.options, this.cssProcessor, this.options.optimizationPlugins);
           const compressionStream = useBrotli ? zlib.createBrotliCompress() : null;
+          const hash = crypto.createHash('sha256');
+          let bytes = 0;
+          const max = this.options.maxAssetSize;
+          const hashStream = new Transform({
+            transform(chunk, enc, cb){
+              bytes += chunk.length; if (bytes > max) return cb(new RegenesisError(ERROR_CODES.MAX_SIZE, 'max size exceeded'));
+              hash.update(chunk); cb(null, chunk);
+            }
+          });
           const writeStream = fss.createWriteStream(full);
 
-          const streams = [res.body, optimizationStream, compressionStream, writeStream].filter(Boolean);
+          const streams = [res.body, ...optimizationStreams, compressionStream, hashStream, writeStream].filter(Boolean);
+          const dlStart = Date.now();
           await pipeline(streams);
+          this.stats.totalDownloadTime += Date.now() - dlStart;
 
-          const finalBuffer = await fs.readFile(full);
-          const hash = crypto.createHash('sha256').update(finalBuffer).digest('hex');
-          this.state.urlToLocalPath.set(assetUrl, localPath);
-          this.state.manifest.assets[localPath] = {
-            originalUrl: assetUrl, contentType, size: finalBuffer.length, integrity: `sha256-${hash}`,
+          const integrity = `sha256-${hash.digest('hex')}`;
+          this.state.urlToLocalPath.set(assetUrl, localPathBrotli);
+          this.state.manifest.assets[localPathBrotli] = {
+            originalUrl: assetUrl, contentType, size: bytes, integrity,
             etag: res.headers.get('etag'), lastModified: res.headers.get('last-modified')
           };
-          this.stats.totalAssets++; this.stats.totalSize += finalBuffer.length;
-          logger.info({ path: localPath, size: `${(finalBuffer.length/1024).toFixed(2)} KB` }, 'Asset captured');
+          this.stats.totalAssets++; this.stats.totalSize += bytes;
+          this.state.pendingAssets.delete(assetUrl);
+          logger.info({ path: localPathBrotli, size: `${(bytes/1024).toFixed(2)} KB` }, 'Asset captured');
+          this.logProgress();
         });
       } catch (e){
+        if (full) await fs.unlink(full).catch(()=>{});
         logger.warn({ url: assetUrl, attempt: attempt+1, err: e.message }, 'Asset download failed');
+        const fatal = e.name === 'AbortError' || /max size/i.test(e.message);
+        if (fatal) attempt = this.options.maxRetries;
         if (attempt < this.options.maxRetries){
           const delay = (this.options.retryDelayBase * Math.pow(2, attempt)) + (Math.random() * 1000);
           await new Promise(r => setTimeout(r, delay));
         } else {
           logger.error({ url: assetUrl }, 'Asset failed after all retries');
           this.state.failedUrls.add(assetUrl); this.stats.failedAssets++;
+          this.state.pendingAssets.delete(assetUrl);
+          this.logProgress();
         }
       }
     }
-  }
-
-  getOptimizationStream(contentType){
-    const { Transform } = require('stream'); // will fallback if import not available
-    if (this.options.optimizeImages && contentType.startsWith('image/')){
-      if (contentType.includes('svg')){
-        return new Transform({
-          readableHighWaterMark: 1 << 20,
-          writableHighWaterMark: 1 << 20,
-          construct(){ this._chunks = []; },
-          transform(chunk, _enc, cb){ this._chunks.push(chunk); cb(); },
-          flush(cb){ 
-            const buf = Buffer.concat(this._chunks);
-            try { this.push(Buffer.from(optimizeSvg(buf.toString()).data)); }
-            catch(e){ this.push(buf); }
-            cb();
-          }
-        });
-      }
-      const s = sharp();
-      if (this.options.enableAVIF) s.avif({ quality: 75 });
-      else s.webp({ quality: 80 });
-      return s;
-    }
-    return new Transform({ transform(chunk, _enc, cb){ cb(null, chunk); } });
   }
 
   async captureScreenshot(page, pageUrl, bp){
@@ -447,14 +394,36 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     await page.setViewport(bp);
     await page.waitForTimeout(500);
     const screenshotPath = this.getLocalPathForUrl(pageUrl).replace(/\.html$/, `_${bp.name}.png`);
-    const full = path.join(this.state.outputDir, screenshotPath);
-    try { await page.screenshot({ path: full, fullPage: true }); logger.info({ path: screenshotPath }, 'Screenshot saved'); }
-    catch (e){ logger.error({ err: e.message }, `Failed screenshot for ${bp.name}`); }
-    finally { await page.setViewport(original); }
+    const full = this.resolveOutputPath(screenshotPath);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    try {
+      await page.screenshot({ path: full, fullPage: true });
+      const buf = await fs.readFile(full);
+      const hash = crypto.createHash('sha256').update(buf).digest('hex');
+      this.state.manifest.assets[screenshotPath] = {
+        originalUrl: pageUrl,
+        contentType: 'image/png',
+        size: buf.length,
+        integrity: `sha256-${hash}`
+      };
+      const pageLocal = this.getLocalPathForUrl(pageUrl);
+      const pageEntry = this.state.manifest.assets[pageLocal];
+      if (pageEntry){
+        pageEntry.screenshots = pageEntry.screenshots || {};
+        pageEntry.screenshots[bp.name] = screenshotPath;
+      }
+      this.stats.totalAssets++; this.stats.totalSize += buf.length;
+      logger.info({ path: screenshotPath }, 'Screenshot saved');
+      this.logProgress();
+    } catch (e){
+      logger.error({ err: e.message }, `Failed screenshot for ${bp.name}`);
+    } finally {
+      await page.setViewport(original);
+    }
   }
 
   async loadManifest(){
-    const manifestPath = path.join(this.state.outputDir, 'manifest.json');
+    const manifestPath = this.resolveOutputPath('manifest.json');
     try{
       const data = await fs.readFile(manifestPath, 'utf8');
       this.state.manifest = JSON.parse(data);
@@ -465,7 +434,7 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     } catch { this.state.manifest = { assets: {} }; }
   }
   async generateManifest(){
-    const manifestPath = path.join(this.state.outputDir, 'manifest.json');
+    const manifestPath = this.resolveOutputPath('manifest.json');
     const data = { replicatedAt: new Date().toISOString(), sourceUrl: this.state.baseUrl, stats: this.stats, assets: this.state.manifest.assets };
     await fs.writeFile(manifestPath, JSON.stringify(data, null, 2));
     logger.info(`Wrote ${manifestPath}`);
@@ -519,6 +488,11 @@ export class UltimateWebsiteReplicator extends EventEmitter {
     const safeDirname = dirname.replace(/[^a-z0-9/_-]/gi, '_');
     return path.join(safeDirname, `${safeBasename}${queryHash}${ext}`);
   }
+  resolveOutputPath(p){
+    const full = path.resolve(this.state.outputDir, p);
+    if (!full.startsWith(this.state.outputDir + path.sep)) throw new RegenesisError(ERROR_CODES.PATH_TRAVERSAL, `Path traversal: ${p}`);
+    return full;
+  }
 }
 
 // --- CLI ---
@@ -530,20 +504,42 @@ async function main(){
        .option('depth', { type: 'number', default: 2 })
        .option('incremental', { type: 'boolean', default: false })
        .option('responsive', { type: 'boolean', default: false })
-       .option('brotli', { type: 'boolean', default: false })
+       .option('image', { type: 'string', choices: ['avif','webp','none'], default: 'avif' })
+       .option('compression', { type: 'string', choices: ['none','brotli'], default: 'none' })
        .option('pageConcurrency', { type: 'number', default: 4 })
        .option('baseAssetConcurrency', { type: 'number', default: 10 })
-       .option('domainAssetConcurrency', { type: 'number', default: 3 });
+       .option('domainAssetConcurrency', { type: 'number', default: 3 })
+       .option('allow', { type: 'array', default: [], describe: 'Additional allowed domains' })
+       .option('ignore-robots', { type: 'boolean', default: false, describe: 'Ignore robots.txt (1 req/sec rate limit)' })
+       .option('maxSize', { type: 'number', default: 5 * 1024 * 1024, describe: 'Max asset size in bytes' })
+       .option('reqTimeout', { type: 'number', default: 30000, describe: 'Asset request timeout ms' })
+       .option('config', { type: 'string', describe: 'Path to config file' });
     }, async (a) => {
-      const r = new UltimateWebsiteReplicator({
+      let fileConfig = {};
+      const explorer = cosmiconfig('regenesis');
+      if (a.config) {
+        const res = await explorer.load(a.config);
+        if (res?.config) fileConfig = res.config;
+      } else {
+        const res = await explorer.search();
+        if (res?.config) fileConfig = res.config;
+      }
+      if (a['ignore-robots']) logger.warn('Ignoring robots.txt! Crawl responsibly.');
+      const r = new UltimateWebsiteReplicator(Object.assign({}, fileConfig, {
         maxCrawlDepth: a.depth,
         incremental: a.incremental,
         captureResponsive: a.responsive,
-        enableBrotli: a.brotli,
-        pageConcurrency: a.pageConcurrency,
-        baseAssetConcurrency: a.baseAssetConcurrency,
-        domainAssetConcurrency: a.domainAssetConcurrency,
-      });
+        imagePolicy: a.image,
+        compression: a.compression,
+        pageConcurrency: a['ignore-robots'] ? 1 : a.pageConcurrency,
+        baseAssetConcurrency: a['ignore-robots'] ? 2 : a.baseAssetConcurrency,
+        domainAssetConcurrency: a['ignore-robots'] ? 1 : a.domainAssetConcurrency,
+        allowedDomains: a.allow,
+        respectRobotsTxt: !a['ignore-robots'],
+        maxAssetSize: a.maxSize,
+        requestTimeout: a.reqTimeout,
+        requestInterval: a['ignore-robots'] ? 1000 : 0,
+      }));
       await r.replicate(a.url, a.outputDir);
     })
     .command('verify <outputDir>', 'Verify integrity of a replica', (y) => {
