@@ -1,5 +1,4 @@
 
-@import url('/generated/motion.css');
 :root { --color-bg:#0b1020; --color-fg:#e7ebf3; --color-accent:#4da3ff; --color-muted:#141a2e; --space:12px; }
 * { box-sizing: border-box; }
 body { margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', sans-serif; color: var(--color-fg); background: var(--color-bg); }

@@ -2,10 +2,18 @@
   "name": "@cyberarchitect/motion-tokens",
   "version": "1.0.0",
   "type": "module",
-  "main": "dist/motion.ts",
-  "types": "dist/motion.ts",
+  "main": "dist/motion.js",
+  "module": "dist/motion.js",
+  "types": "dist/motion.d.ts",
   "scripts": {
-    "build": "node build.js"
+    "build": "node build.cjs"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/motion.js",
+      "default": "./dist/motion.js"
+    },
+    "./motion.css": "./dist/motion.css"
   },
   "license": "MIT"
 }
