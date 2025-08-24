@@ -44,7 +44,9 @@ export function createOptimizationPipeline(contentType, options, cssProcessor, p
     try {
       const s = plugin(contentType);
       if (s) streams.push(s);
-    } catch {}
+    } catch (e) {
+      console.warn('Failed to initialize optimization plugin:', e);
+    }
   }
 
   if (streams.length === 0) return [new PassThrough()];
