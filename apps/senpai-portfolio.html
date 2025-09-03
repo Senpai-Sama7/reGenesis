@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Douglas Mitchell | CyberArchitect</title>
+<style>
+:root {
+  --accent: #00c9ff;
+  --bg: #05050a;
+  --text: #f5f5f7;
+  --secondary: #8a8f98;
+}
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+canvas#bg {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+}
+nav {
+  position: fixed;
+  top: 30px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 3rem;
+  z-index: 10;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+}
+nav a {
+  color: var(--text);
+  text-decoration: none;
+  opacity: 0.6;
+  transition: opacity 0.3s;
+}
+nav a:hover {
+  opacity: 1;
+}
+main {
+  height: 100vh;
+  overflow-y: scroll;
+  scroll-snap-type: y mandatory;
+}
+section {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  scroll-snap-align: center;
+  padding: 0 1rem;
+}
+#hero h1 {
+  font-size: 4rem;
+  letter-spacing: 0.05em;
+  margin-bottom: 1rem;
+}
+#hero p {
+  color: var(--secondary);
+}
+h2 {
+  font-size: 2rem;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+ul {
+  list-style: none;
+  padding: 0;
+}
+li {
+  margin: 0.5rem 0;
+}
+footer {
+  padding: 2rem;
+  font-size: 0.8rem;
+  text-align: center;
+  color: var(--secondary);
+}
+.cursor {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  pointer-events: none;
+  mix-blend-mode: difference;
+  z-index: 100;
+}
+.reveal {
+  opacity: 0;
+  transform: translateY(40px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<div class="cursor" id="cursor"></div>
+<nav>
+  <a href="#about">About</a>
+  <a href="#skills">Skills</a>
+  <a href="#accomplishments">Accomplishments</a>
+  <a href="#contact">Contact</a>
+</nav>
+<main>
+  <section id="hero">
+    <h1>Douglas Mitchell</h1>
+    <p>CyberArchitect forging digital realms</p>
+  </section>
+  <section id="about" class="reveal">
+    <h2>About</h2>
+    <p>Houston-based developer pushing immersive web futures with anime-fueled style and technical precision.</p>
+  </section>
+  <section id="skills" class="reveal">
+    <h2>Skills</h2>
+    <ul>
+      <li>TypeScript, Node.js &amp; WebGL</li>
+      <li>Three.js &amp; shader experiments</li>
+      <li>CI/CD &amp; DevOps automation</li>
+      <li>Design systems &amp; motion language</li>
+    </ul>
+  </section>
+  <section id="accomplishments" class="reveal">
+    <h2>Accomplishments</h2>
+    <ul>
+      <li>Built <em>reGenesis</em> to streamline high-fidelity web experiences</li>
+      <li>Published 20+ open-source projects</li>
+      <li>Community recognition for anime-infused interactive design</li>
+    </ul>
+  </section>
+  <section id="contact" class="reveal">
+    <h2>Contact</h2>
+    <p>Reach out on <a style="color:var(--accent)" target="_blank" href="https://github.com/Senpai-Sama7">GitHub</a> or email <a style="color:var(--accent)" href="mailto:contact@example.com">contact@example.com</a></p>
+  </section>
+  <footer>&copy; <span id="year"></span> Douglas Mitchell</footer>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/three@0.150.1/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.2/dist/gsap.min.js"></script>
+<script>
+  // custom cursor
+  const cursor = document.getElementById('cursor');
+  document.addEventListener('mousemove', e => {
+    gsap.to(cursor, {x: e.clientX, y: e.clientY, duration: 0.1});
+  });
+
+  // background scene
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 1000);
+  const renderer = new THREE.WebGLRenderer({canvas: document.getElementById('bg'), antialias: true});
+  renderer.setSize(innerWidth, innerHeight);
+
+  const geometry = new THREE.IcosahedronGeometry(18, 2);
+  const material = new THREE.MeshStandardMaterial({wireframe: true, color: 0x00c9ff});
+  const icosa = new THREE.Mesh(geometry, material);
+  scene.add(icosa);
+
+  const ambient = new THREE.AmbientLight(0x222222);
+  scene.add(ambient);
+  const point = new THREE.PointLight(0x00c9ff, 1);
+  point.position.set(25, 25, 25);
+  scene.add(point);
+
+  camera.position.z = 40;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    icosa.rotation.x += 0.003;
+    icosa.rotation.y += 0.004;
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // parallax camera movement
+  document.addEventListener('pointermove', ({clientX, clientY}) => {
+    const x = (clientX / innerWidth - 0.5) * 2;
+    const y = -(clientY / innerHeight - 0.5) * 2;
+    gsap.to(camera.position, {x: x * 5, y: y * 5, duration: 1, overwrite: 'auto'});
+  });
+
+  // resize handling
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  // reveal sections
+  const obs = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) entry.target.classList.add('visible');
+    });
+  }, {threshold: 0.3});
+  document.querySelectorAll('.reveal').forEach(el => obs.observe(el));
+
+  document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+</body>
+</html>
