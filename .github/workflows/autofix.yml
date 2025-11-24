@@ -11,7 +11,7 @@ jobs:
   autofix:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
