@@ -17,65 +17,24 @@ export default function Page(){
   const [backupUrl, setBackupUrl] = useState("https://example.com");
   const [status, setStatus] = useState<string | null>(null);
   const [backupStatus, setBackupStatus] = useState<string | null>(null);
-  const [backupFrequency, setBackupFrequency] = useState("One-time snapshot");
-  const [isSavingBrief, setIsSavingBrief] = useState(false);
-  const [isSchedulingBackup, setIsSchedulingBackup] = useState(false);
 
   useEffect(() => {
     const lenis = initLenis({ smooth: true, duration: 1.2 });
     syncWithScrollTrigger(lenis);
-
-    return () => {
-      lenis?.destroy();
-    };
   }, []);
 
   const briefPreview = useMemo(() => {
     return `We heard you: a ${brief.tone.toLowerCase()} brand voice for ${brief.name}, serving ${brief.audience}. We'll ship a site with a ${brief.palette} palette plus homepage, menu/services, reviews, and contact CTA.`;
   }, [brief]);
 
-  const previewBlocks = useMemo(
-    () => ({
-      hero: {
-        headline: `${brief.name}: ${brief.summary}`,
-        subhead: `Built for ${brief.audience}. We keep the tone ${brief.tone.toLowerCase()} and align colors to ${brief.palette}.`,
-      },
-      highlights: [
-        "Mobile-first layout with accessibility checks",
-        "SEO-ready headings, metadata, and open graph tags",
-        "Contact + booking CTA tied to your preferred channel",
-      ],
-      seo: [
-        `${brief.name} — ${brief.palette} aesthetic`,
-        `${brief.name} services for ${brief.audience}`,
-        `${brief.name} reviews and bookings`,
-      ],
-    }),
-    [brief]
-  );
-
   function handleBriefSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setIsSavingBrief(true);
-    setStatus(null);
-
-    setTimeout(() => {
-      setIsSavingBrief(false);
-      setStatus(`Saved! Generating a preview for ${brief.name} with ${brief.palette} styling and ${brief.tone} tone.`);
-    }, 500);
+    setStatus("Thanks! We saved your Brand Brief. Click \"Generate my site\" to see a live preview in minutes.");
   }
 
   function handleBackupSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setIsSchedulingBackup(true);
-    setBackupStatus(null);
-
-    setTimeout(() => {
-      setIsSchedulingBackup(false);
-      setBackupStatus(
-        `Backup scheduled for ${backupUrl} (${backupFrequency}). We'll capture a pixel-perfect offline copy and email your download link.`
-      );
-    }, 500);
+    setBackupStatus("Backup scheduled. We'll capture a pixel-perfect offline copy and email your download link.");
   }
 
   return (
@@ -87,7 +46,6 @@ export default function Page(){
             { href: "#hero", label: "Overview" },
             { href: "#how-it-works", label: "How it works" },
             { href: "#brand-brief", label: "Brand Brief" },
-            { href: "#preview", label: "Preview" },
             { href: "#backup", label: "Backup" },
             { href: "#hosting", label: "Hosting" },
           ]}
@@ -199,9 +157,7 @@ export default function Page(){
             </div>
             <p className="preview" aria-live="polite">{briefPreview}</p>
             <div className="cta-row">
-              <Button type="submit" disabled={isSavingBrief}>
-                {isSavingBrief ? "Saving..." : "Generate my site"}
-              </Button>
+              <Button type="submit">Generate my site</Button>
               <Button
                 className="ghost"
                 type="button"
@@ -211,63 +167,7 @@ export default function Page(){
               </Button>
             </div>
           </form>
-          {status && <div className="notice success" role="status" aria-live="polite">{status}</div>}
-        </Section>
-
-        <Section id="preview" aria-labelledby="preview-heading" className="card preview">
-          <div className="preview-header">
-            <div>
-              <p className="eyebrow">Live preview</p>
-              <h2 id="preview-heading">{brief.name} site preview</h2>
-              <p className="muted">Automatic sections generated from your Brand Brief. Swap text or imagery anytime.</p>
-            </div>
-            <div className="pill-row">
-              <span className="pill">{brief.palette}</span>
-              <span className="pill">{brief.tone}</span>
-            </div>
-          </div>
-          <div className="preview-grid">
-            <div className="preview-card">
-              <p className="eyebrow">Hero</p>
-              <h3>{previewBlocks.hero.headline}</h3>
-              <p className="muted">{previewBlocks.hero.subhead}</p>
-              <div className="cta-row">
-                <Button>Book a visit</Button>
-                <Button className="ghost">View menu/services</Button>
-              </div>
-            </div>
-            <div className="preview-card">
-              <p className="eyebrow">Highlights</p>
-              <ul className="checklist compact">
-                {previewBlocks.highlights.map(item => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-              <div className="tag-cloud" aria-label="Suggested color accents">
-                <span className="tag">Primary: {brief.palette}</span>
-                <span className="tag">Tone: {brief.tone}</span>
-                <span className="tag">CTA: Contact & booking</span>
-              </div>
-            </div>
-            <div className="preview-card">
-              <p className="eyebrow">SEO plan</p>
-              <ol className="steps compact">
-                {previewBlocks.seo.map(item => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ol>
-              <div className="meta">
-                <div>
-                  <span className="eyebrow">Meta title</span>
-                  <p>{brief.name} — {brief.summary}</p>
-                </div>
-                <div>
-                  <span className="eyebrow">Meta description</span>
-                  <p>Serving {brief.audience} with a {brief.tone.toLowerCase()} voice and {brief.palette} look.</p>
-                </div>
-              </div>
-            </div>
-          </div>
+          {status && <div className="notice success" role="status">{status}</div>}
         </Section>
 
         <Section id="backup" aria-labelledby="backup-heading" className="card">
@@ -287,17 +187,15 @@ export default function Page(){
             </label>
             <label className="inline-label">
               Frequency
-              <select value={backupFrequency} onChange={e => setBackupFrequency(e.target.value)}>
+              <select>
                 <option>One-time snapshot</option>
                 <option>Weekly refresh</option>
                 <option>Monthly refresh</option>
               </select>
             </label>
-            <Button type="submit" disabled={isSchedulingBackup}>
-              {isSchedulingBackup ? "Scheduling..." : "Schedule backup"}
-            </Button>
+            <Button type="submit">Schedule backup</Button>
           </form>
-          {backupStatus && <div className="notice" role="status" aria-live="polite">{backupStatus}</div>}
+          {backupStatus && <div className="notice" role="status">{backupStatus}</div>}
           <ul className="checklist compact">
             <li>Offline HTML + assets, plus manifest for integrity</li>
             <li>Ideal for migrations or investor due diligence</li>

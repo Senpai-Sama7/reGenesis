@@ -62,7 +62,6 @@ main { display: flex; flex-direction: column; gap: calc(var(--space) * 2); paddi
 .checklist.compact { gap: 4px; font-size: 14px; }
 
 .steps { padding-left: 18px; display: grid; gap: 10px; }
-.steps.compact { gap: 6px; }
 
 .form { display: grid; gap: 14px; margin-top: 12px; }
 .form.inline { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: end; }
@@ -108,14 +107,6 @@ main { display: flex; flex-direction: column; gap: calc(var(--space) * 2); paddi
 
 .fade-in { opacity: 0; transform: translateY(6px); transition: opacity .6s var(--ease, ease), transform .6s var(--ease, ease); }
 .fade-in.in-view { opacity: 1; transform: none; }
-
-.preview { display: grid; gap: 18px; }
-.preview-header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
-.preview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
-.preview-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: grid; gap: 10px; }
-.tag-cloud { display: flex; flex-wrap: wrap; gap: 8px; }
-.tag { background: rgba(77,163,255,0.08); border: 1px solid rgba(77,163,255,0.2); border-radius: 999px; padding: 6px 10px; font-size: 12px; }
-.meta { display: grid; gap: 10px; font-size: 14px; }
 
 @media (max-width: 640px) {
   .site-header { flex-direction: column; align-items: flex-start; gap: 12px; position: sticky; }
